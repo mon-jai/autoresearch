@@ -1,6 +1,7 @@
 import os
 import time
 import math
+import copy
 import torch
 import torch.nn.functional as F
 
@@ -81,6 +82,11 @@ def train():
     critic = RealismCritic(config).to(DEVICE)
     encoder = KGEncoder(config).to(DEVICE)
     kbgan_gen = KBGANGenerator(config).to(DEVICE)
+
+    # EMA of encoder for stable evaluation
+    ema_encoder = copy.deepcopy(encoder)
+    ema_encoder.eval()
+    ema_decay = 0.999
 
     # 2. 宣告獨立優化器 (Critic 用較低 LR 避免主導)
     opt_decoder = torch.optim.AdamW(decoder.parameters(), lr=LEARNING_RATE)
@@ -183,6 +189,11 @@ def train():
         torch.nn.utils.clip_grad_norm_(encoder.parameters(), MAX_GRAD_NORM)
         opt_encoder.step()
 
+        # Update EMA encoder
+        with torch.no_grad():
+            for p_ema, p in zip(ema_encoder.parameters(), encoder.parameters()):
+                p_ema.data.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
+
         if torch.cuda.is_available(): torch.cuda.empty_cache()
 
         # ---------------------------------------------------------------------
@@ -216,10 +227,21 @@ def train():
         # Logging & Debugging
         # ---------------------------------------------------------------------
         if step % 10 == 0 or step == MAX_STEPS - 1:
+            # EMA encoder evaluation
+            with torch.no_grad():
+                ema_ent, ema_rel = ema_encoder(synth_text_ids)
+                ema_dist_pos_ent = F.mse_loss(ema_ent, gt_entities, reduction='none').mean(dim=-1)
+                ema_dist_neg_ent = F.mse_loss(ema_ent, hard_neg_ent.detach(), reduction='none').mean(dim=-1)
+                ema_rec_ent = F.relu(ema_dist_pos_ent - ema_dist_neg_ent + 0.3).mean()
+                ema_dist_pos_rel = F.mse_loss(ema_rel, gt_relations, reduction='none').mean(dim=-1)
+                ema_dist_neg_rel = F.mse_loss(ema_rel, hard_neg_rel.detach(), reduction='none').mean(dim=-1)
+                ema_rec_rel = F.relu(ema_dist_pos_rel - ema_dist_neg_rel + 0.3).mean()
+                ema_rec = ema_rec_ent + ema_rec_rel
+
             t1 = time.time()
             dt = t1 - t0
             t0 = t1
-            print(f"[Step {step:03d}] L_critic: {loss_critic.item():.4f} | L_realism: {loss_realism.item():.4f} | L_rec: {loss_rec.item():.4f} | Time: {dt*1000:.2f}ms")
+            print(f"[Step {step:03d}] L_critic: {loss_critic.item():.4f} | L_realism: {loss_realism.item():.4f} | L_rec: {loss_rec.item():.4f} | L_rec_ema: {ema_rec.item():.4f} | Time: {dt*1000:.2f}ms")
 
 if __name__ == "__main__":
     train()
