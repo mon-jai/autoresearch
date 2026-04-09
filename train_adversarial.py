@@ -16,7 +16,7 @@ from models.decoder import KGDecoder, RealismCritic
 # Configuration parameters
 # -----------------------------------------------------------------------------
 BATCH_SIZE = 4
-MAX_STEPS = 500
+MAX_STEPS = 1000
 LEARNING_RATE = 3e-4
 CRITIC_LR = 1e-4      # Critic learns slower → prevents it from dominating
 MAX_GRAD_NORM = 1.0
@@ -88,10 +88,11 @@ def train():
     opt_encoder = torch.optim.AdamW(encoder.parameters(), lr=LEARNING_RATE)
     opt_kbgan_gen = torch.optim.AdamW(kbgan_gen.parameters(), lr=LEARNING_RATE)
 
-    # 3. 學習率調度器 (Cosine Annealing) — 防止 loss 平坦化
+    # 3. 學習率調度器
     sched_decoder = torch.optim.lr_scheduler.CosineAnnealingLR(opt_decoder, T_max=MAX_STEPS)
     sched_critic = torch.optim.lr_scheduler.CosineAnnealingLR(opt_critic, T_max=MAX_STEPS)
-    sched_encoder = torch.optim.lr_scheduler.CosineAnnealingLR(opt_encoder, T_max=MAX_STEPS)
+    # Encoder: linear decay to 10% of initial LR — 後期穩定，減少震盪
+    sched_encoder = torch.optim.lr_scheduler.LinearLR(opt_encoder, start_factor=1.0, end_factor=0.1, total_iters=MAX_STEPS)
     sched_kbgan = torch.optim.lr_scheduler.CosineAnnealingLR(opt_kbgan_gen, T_max=MAX_STEPS)
 
     # 4. 結構化合成數據源 (KBGAN 洞見：替代純隨機負採樣)
