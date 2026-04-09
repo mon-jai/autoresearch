@@ -171,11 +171,11 @@ def train():
         # Margin-Based Contrastive Loss
         dist_pos_ent = F.mse_loss(ent_logits, gt_entities, reduction='none').mean(dim=-1)
         dist_neg_ent = F.mse_loss(ent_logits, hard_neg_ent.detach(), reduction='none').mean(dim=-1)
-        loss_rec_ent = F.relu(dist_pos_ent - dist_neg_ent + 1.0).mean()
+        loss_rec_ent = F.relu(dist_pos_ent - dist_neg_ent + 0.5).mean()
 
         dist_pos_rel = F.mse_loss(rel_logits, gt_relations, reduction='none').mean(dim=-1)
         dist_neg_rel = F.mse_loss(rel_logits, hard_neg_rel.detach(), reduction='none').mean(dim=-1)
-        loss_rec_rel = F.relu(dist_pos_rel - dist_neg_rel + 1.0).mean()
+        loss_rec_rel = F.relu(dist_pos_rel - dist_neg_rel + 0.5).mean()
 
         loss_rec = loss_rec_ent + loss_rec_rel
         loss_rec.backward()
