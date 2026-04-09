@@ -68,7 +68,7 @@ def train():
 
     # 初始化模型設定，配合測試稍降維度
     config = GPTConfig(
-        n_layer=4,
+        n_layer=6,
         n_head=8,
         n_kv_head=8,
         n_embd=512,
