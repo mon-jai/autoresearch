@@ -97,8 +97,8 @@ def train():
     # 3. 學習率調度器
     sched_decoder = torch.optim.lr_scheduler.CosineAnnealingLR(opt_decoder, T_max=MAX_STEPS)
     sched_critic = torch.optim.lr_scheduler.CosineAnnealingLR(opt_critic, T_max=MAX_STEPS)
-    # Encoder: linear decay to 10% of initial LR — 後期穩定，減少震盪
-    sched_encoder = torch.optim.lr_scheduler.LinearLR(opt_encoder, start_factor=1.0, end_factor=0.1, total_iters=MAX_STEPS)
+    # exp70: Encoder linear decay to 20% (was 10%) — with LR=1e-3, final=2e-4 gives more late-phase learning
+    sched_encoder = torch.optim.lr_scheduler.LinearLR(opt_encoder, start_factor=1.0, end_factor=0.2, total_iters=MAX_STEPS)
     sched_kbgan = torch.optim.lr_scheduler.CosineAnnealingLR(opt_kbgan_gen, T_max=MAX_STEPS)
 
     # 4. 結構化合成數據源 (KBGAN 洞見：替代純隨機負採樣)
