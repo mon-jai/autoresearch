@@ -67,7 +67,10 @@ LOOP FOREVER (with strategic breakpoints):
 9. **Evaluate**:
    - L_rec improved → **keep** commit
    - L_rec worse → **discard**, `git reset --hard HEAD~1`
-   - L_rec crosses 0.5 / 0.1 / 0.01 → **Milestone** (pause, `python scripts/gen_report.py milestone <value>`)
+   - L_rec crosses 0.5 / 0.1 / 0.01 → **Milestone** (mode-aware, see below)
+     - Always: `python scripts/gen_report.py milestone <value>` and `git tag milestone-lrec-<value>`
+     - If `$AUTORESEARCH_MODE == interactive` (default, daytime): **PAUSE** for human review
+     - If `$AUTORESEARCH_MODE == overnight`: **DO NOT PAUSE**. Invoke `/scientific-brainstorming` to list 3 candidate next directions within the current research family (margin / encoder / KBGAN / data), pick one with the strongest expected ROI, and resume LOOP. The human will review the report at Morning Review (07:00). Radical pivots are explicitly the human's call, not yours.
 10. Stuck 3+ experiments → **Knowledge Pipeline** (see below)
 11. Knowledge Pipeline triggered 2+ times without improvement → **Stagnation** (pause)
 
@@ -150,7 +153,7 @@ Each breakpoint type has specific skills that SHOULD be invoked:
 
 | Type | Trigger | Pause? | Report | Skills to invoke |
 |------|---------|--------|--------|-----------------|
-| **Milestone** | L_rec < 0.5 / 0.1 / 0.01 | Yes | `reports/milestones/` | `/scientific-writing` for structured report, `/research-lookup` for next direction |
+| **Milestone** | L_rec < 0.5 / 0.1 / 0.01 | **Mode-aware**: Yes if `interactive`, No if `overnight` | `reports/milestones/` | `/scientific-writing` for structured report; `overnight` mode also runs `/scientific-brainstorming` to pick a conservative next direction |
 | **Morning** | After 07:00, no today's report | Yes | `reports/daily/` | `/scientific-visualization` for L_rec trend chart |
 | **Stagnation** | Knowledge Pipeline 2+ times, no improvement | Yes | `reports/milestones/` | `/scientific-brainstorming` first, then `/research-lookup` to validate ideas |
 | **Checkpoint** | Every 10 experiments | No | `reports/checkpoints/` | `/scientific-visualization` for progress chart |
@@ -173,6 +176,9 @@ Each breakpoint type has specific skills that SHOULD be invoked:
 1. `/scientific-writing` — write structured milestone report
 2. `/scientific-visualization` — generate L_rec trajectory plot
 3. `/research-lookup` — find papers for next research direction
+4. **Mode-aware continuation** (check `$AUTORESEARCH_MODE`):
+   - `interactive` (default): PAUSE for human review
+   - `overnight`: DO NOT pause. Run `/scientific-brainstorming` to list 3 candidate next directions **within the current research family** (margin / encoder / KBGAN / data tweaks). Pick the strongest expected ROI and resume the loop. Radical pivots (whole new paradigm) are reserved for the human at Morning Review — do not attempt them yourself overnight.
 
 **Stagnation (deep stuck):**
 1. `/scientific-brainstorming` — radical ideation session
@@ -182,3 +188,10 @@ Each breakpoint type has specific skills that SHOULD be invoked:
 ## Autonomous behavior
 
 Between breakpoints, you are fully autonomous. Do NOT pause to ask the human. Do NOT ask "should I keep going?". The human might be asleep. Think harder — use the scientific skills above, read wiki, try radical changes. The loop runs until a breakpoint fires or the human interrupts.
+
+## Operating modes
+
+Read the `AUTORESEARCH_MODE` environment variable at session start (default: `interactive`).
+
+- **`interactive`** (daytime, human in the loop): Milestone breakpoint pauses so the human can review and steer. This is the default and matches Karpathy's original design.
+- **`overnight`** (set by `scripts/run_overnight.sh`): No human will respond until 07:00. Milestone is **soft** — write the report, tag the commit, run `/scientific-brainstorming` to pick the next direction within the current research family, and resume the loop. The only hard stop overnight is the Morning Review breakpoint at 07:00. Radical pivots remain a human decision; you do conservative pivots only.
