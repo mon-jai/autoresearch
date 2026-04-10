@@ -17,7 +17,7 @@ from models.decoder import KGDecoder, RealismCritic
 # Configuration parameters
 # -----------------------------------------------------------------------------
 BATCH_SIZE = 16
-MAX_STEPS = 1000
+MAX_STEPS = 2000  # exp48: double training for projection heads convergence
 LEARNING_RATE = 3e-4
 CRITIC_LR = 1e-4      # Critic learns slower → prevents it from dominating
 MAX_GRAD_NORM = 1.0
