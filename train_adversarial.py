@@ -17,7 +17,7 @@ from models.decoder import KGDecoder, RealismCritic
 # Configuration parameters
 # -----------------------------------------------------------------------------
 BATCH_SIZE = 32  # exp60: 16→32 (variance reduction, 4→16 halved oscillation previously)
-MAX_STEPS = 3000  # exp92: 2000→3000 for deeper 8-layer model convergence
+MAX_STEPS = 2000  # exp48: double training for projection heads convergence
 LEARNING_RATE = 3e-4
 CRITIC_LR = 1e-4      # Critic learns slower → prevents it from dominating
 MAX_GRAD_NORM = 1.0
@@ -176,7 +176,9 @@ def train():
         hard_neg_ent, hard_neg_rel, _, _ = kbgan_gen(gt_entities, gt_relations)
 
         # Cosine Margin-Based Contrastive Loss + tight encoder grad clip
-        MARGIN = 0.01
+        # exp92: margin annealing 0.03→0.003 (strong signal early, fine-grained late)
+        margin_start, margin_end = 0.03, 0.003
+        MARGIN = margin_start + (margin_end - margin_start) * (step / MAX_STEPS)
         ENCODER_GRAD_NORM = 0.3  # exp33: tighter clip to tame cosine oscillation
         dist_pos_ent = 1.0 - F.cosine_similarity(ent_logits, gt_entities, dim=-1)
         dist_neg_ent = 1.0 - F.cosine_similarity(ent_logits, hard_neg_ent.detach(), dim=-1)
@@ -264,8 +266,8 @@ def train():
             dn_ent = 1.0 - F.cosine_similarity(ev_ent_logits, ev_neg_ent, dim=-1)
             dp_rel = 1.0 - F.cosine_similarity(ev_rel_logits, ev_rel, dim=-1)
             dn_rel = 1.0 - F.cosine_similarity(ev_rel_logits, ev_neg_rel, dim=-1)
-            MARGIN = 0.01
-            rec = (F.relu(dp_ent - dn_ent + MARGIN).mean() + F.relu(dp_rel - dn_rel + MARGIN).mean()).item()
+            eval_margin = 0.003  # exp92: eval uses final margin
+            rec = (F.relu(dp_ent - dn_ent + eval_margin).mean() + F.relu(dp_rel - dn_rel + eval_margin).mean()).item()
             eval_recs.append(rec)
     avg_rec = sum(eval_recs) / len(eval_recs)
     std_rec = (sum((x-avg_rec)**2 for x in eval_recs)/len(eval_recs))**0.5
