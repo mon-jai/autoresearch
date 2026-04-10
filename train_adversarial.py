@@ -91,7 +91,7 @@ def train():
     # 2. 宣告獨立優化器 (Critic 用較低 LR 避免主導)
     opt_decoder = torch.optim.AdamW(decoder.parameters(), lr=LEARNING_RATE)
     opt_critic = torch.optim.AdamW(critic.parameters(), lr=CRITIC_LR)
-    opt_encoder = torch.optim.AdamW(encoder.parameters(), lr=LEARNING_RATE)
+    opt_encoder = torch.optim.AdamW(encoder.parameters(), lr=1e-3)  # exp66: encoder LR 3e-4→1e-3 (more optimization budget before decay)
     opt_kbgan_gen = torch.optim.AdamW(kbgan_gen.parameters(), lr=LEARNING_RATE)
 
     # 3. 學習率調度器
