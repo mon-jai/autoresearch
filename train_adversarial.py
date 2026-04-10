@@ -175,18 +175,20 @@ def train():
         # KBGAN Generator 產生困難負樣本 (Hard Negatives) + REINFORCE log_probs
         hard_neg_ent, hard_neg_rel, _, _ = kbgan_gen(gt_entities, gt_relations)
 
-        # Margin-Based Contrastive Loss
-        dist_pos_ent = F.mse_loss(ent_logits, gt_entities, reduction='none').mean(dim=-1)
-        dist_neg_ent = F.mse_loss(ent_logits, hard_neg_ent.detach(), reduction='none').mean(dim=-1)
-        loss_rec_ent = F.relu(dist_pos_ent - dist_neg_ent + 0.01).mean()
+        # Cosine Margin-Based Contrastive Loss + tight encoder grad clip
+        MARGIN = 0.01
+        ENCODER_GRAD_NORM = 0.3  # exp33: tighter clip to tame cosine oscillation
+        dist_pos_ent = 1.0 - F.cosine_similarity(ent_logits, gt_entities, dim=-1)
+        dist_neg_ent = 1.0 - F.cosine_similarity(ent_logits, hard_neg_ent.detach(), dim=-1)
+        loss_rec_ent = F.relu(dist_pos_ent - dist_neg_ent + MARGIN).mean()
 
-        dist_pos_rel = F.mse_loss(rel_logits, gt_relations, reduction='none').mean(dim=-1)
-        dist_neg_rel = F.mse_loss(rel_logits, hard_neg_rel.detach(), reduction='none').mean(dim=-1)
-        loss_rec_rel = F.relu(dist_pos_rel - dist_neg_rel + 0.01).mean()
+        dist_pos_rel = 1.0 - F.cosine_similarity(rel_logits, gt_relations, dim=-1)
+        dist_neg_rel = 1.0 - F.cosine_similarity(rel_logits, hard_neg_rel.detach(), dim=-1)
+        loss_rec_rel = F.relu(dist_pos_rel - dist_neg_rel + MARGIN).mean()
 
         loss_rec = loss_rec_ent + loss_rec_rel
         loss_rec.backward()
-        torch.nn.utils.clip_grad_norm_(encoder.parameters(), MAX_GRAD_NORM)
+        torch.nn.utils.clip_grad_norm_(encoder.parameters(), ENCODER_GRAD_NORM)
         opt_encoder.step()
 
         # Update EMA encoder
@@ -230,12 +232,12 @@ def train():
             # EMA encoder evaluation
             with torch.no_grad():
                 ema_ent, ema_rel = ema_encoder(synth_text_ids)
-                ema_dist_pos_ent = F.mse_loss(ema_ent, gt_entities, reduction='none').mean(dim=-1)
-                ema_dist_neg_ent = F.mse_loss(ema_ent, hard_neg_ent.detach(), reduction='none').mean(dim=-1)
-                ema_rec_ent = F.relu(ema_dist_pos_ent - ema_dist_neg_ent + 0.01).mean()
-                ema_dist_pos_rel = F.mse_loss(ema_rel, gt_relations, reduction='none').mean(dim=-1)
-                ema_dist_neg_rel = F.mse_loss(ema_rel, hard_neg_rel.detach(), reduction='none').mean(dim=-1)
-                ema_rec_rel = F.relu(ema_dist_pos_rel - ema_dist_neg_rel + 0.01).mean()
+                ema_dist_pos_ent = 1.0 - F.cosine_similarity(ema_ent, gt_entities, dim=-1)
+                ema_dist_neg_ent = 1.0 - F.cosine_similarity(ema_ent, hard_neg_ent.detach(), dim=-1)
+                ema_rec_ent = F.relu(ema_dist_pos_ent - ema_dist_neg_ent + MARGIN).mean()
+                ema_dist_pos_rel = 1.0 - F.cosine_similarity(ema_rel, gt_relations, dim=-1)
+                ema_dist_neg_rel = 1.0 - F.cosine_similarity(ema_rel, hard_neg_rel.detach(), dim=-1)
+                ema_rec_rel = F.relu(ema_dist_pos_rel - ema_dist_neg_rel + MARGIN).mean()
                 ema_rec = ema_rec_ent + ema_rec_rel
 
             t1 = time.time()
