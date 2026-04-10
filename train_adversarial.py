@@ -245,5 +245,28 @@ def train():
             t0 = t1
             print(f"[Step {step:03d}] L_critic: {loss_critic.item():.4f} | L_realism: {loss_realism.item():.4f} | L_rec: {loss_rec.item():.4f} | L_rec_ema: {ema_rec.item():.4f} | Time: {dt*1000:.2f}ms")
 
+    # =========================================================================
+    # exp43: Multi-batch final evaluation (20 batches with EMA encoder)
+    # Reduces eval variance from single-batch ~0.001-0.020 to stable estimate
+    # =========================================================================
+    N_EVAL = 20
+    eval_recs = []
+    ema_encoder.eval()
+    with torch.no_grad():
+        for _ in range(N_EVAL):
+            ev_text, ev_kg, ev_ent, ev_rel = data_source.sample(BATCH_SIZE)
+            ev_synth = torch.argmax(decoder(ev_kg, ev_text), dim=-1)
+            ev_ent_logits, ev_rel_logits = ema_encoder(ev_synth)
+            ev_neg_ent, ev_neg_rel, _, _ = kbgan_gen(ev_ent, ev_rel)
+            dp_ent = 1.0 - F.cosine_similarity(ev_ent_logits, ev_ent, dim=-1)
+            dn_ent = 1.0 - F.cosine_similarity(ev_ent_logits, ev_neg_ent, dim=-1)
+            dp_rel = 1.0 - F.cosine_similarity(ev_rel_logits, ev_rel, dim=-1)
+            dn_rel = 1.0 - F.cosine_similarity(ev_rel_logits, ev_neg_rel, dim=-1)
+            MARGIN = 0.01
+            rec = (F.relu(dp_ent - dn_ent + MARGIN).mean() + F.relu(dp_rel - dn_rel + MARGIN).mean()).item()
+            eval_recs.append(rec)
+    avg_rec = sum(eval_recs) / len(eval_recs)
+    print(f"[FINAL] L_rec_avg20: {avg_rec:.4f} | L_rec_min: {min(eval_recs):.4f} | L_rec_max: {max(eval_recs):.4f} | L_rec_std: {(sum((x-avg_rec)**2 for x in eval_recs)/len(eval_recs))**0.5:.4f}")
+
 if __name__ == "__main__":
     train()
