@@ -53,8 +53,8 @@ class StructuredKGData:
         rel_idx = torch.randint(0, self.config.num_relations, (batch_size,), device=self.device)
 
         # 從 prototype table 查表 + 加入微量噪聲
-        gt_entities = self.entity_protos[ent_idx] + torch.randn(batch_size, self.config.num_entities, device=self.device) * 0.02
-        gt_relations = self.relation_protos[rel_idx] + torch.randn(batch_size, self.config.num_relations, device=self.device) * 0.02
+        gt_entities = self.entity_protos[ent_idx] + torch.randn(batch_size, self.config.num_entities, device=self.device) * 0.01  # exp73: noise 0.02→0.01 (cleaner signal for stronger encoder)
+        gt_relations = self.relation_protos[rel_idx] + torch.randn(batch_size, self.config.num_relations, device=self.device) * 0.01
 
         # 模擬文字輸入 Token
         real_text_ids = torch.randint(0, self.config.vocab_size, (batch_size, self.config.sequence_len), device=self.device)
