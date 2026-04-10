@@ -92,7 +92,7 @@ def train():
     opt_decoder = torch.optim.AdamW(decoder.parameters(), lr=LEARNING_RATE)
     opt_critic = torch.optim.AdamW(critic.parameters(), lr=CRITIC_LR)
     opt_encoder = torch.optim.AdamW(encoder.parameters(), lr=1e-3)  # exp66: encoder LR 3e-4→1e-3 (more optimization budget before decay)
-    opt_kbgan_gen = torch.optim.AdamW(kbgan_gen.parameters(), lr=LEARNING_RATE)
+    opt_kbgan_gen = torch.optim.AdamW(kbgan_gen.parameters(), lr=1e-3)  # exp75: KBGAN LR 3e-4→1e-3 (stronger generator for harder negatives)
 
     # 3. 學習率調度器
     sched_decoder = torch.optim.lr_scheduler.CosineAnnealingLR(opt_decoder, T_max=MAX_STEPS)
