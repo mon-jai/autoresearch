@@ -112,7 +112,7 @@ def evaluate(model, dataloader, device) -> dict:
         gold_relations_list = batch["gold_relations"]
         num_words_list = batch["num_words"]
 
-        hidden = model.encode(input_ids, attention_mask)
+        hidden = model.encode(modality="text", input_ids=input_ids, attention_mask=attention_mask)
         ner_logits = model.forward_ner(hidden)  # (B, T, C)
 
         for b_idx in range(input_ids.size(0)):
