@@ -33,9 +33,14 @@ BIO_TAG2ID = {t: i for i, t in enumerate(BIO_TAGS)}
 ID2BIO = {i: t for t, i in BIO_TAG2ID.items()}
 NUM_BIO_TAGS = len(BIO_TAGS)
 
-REL2ID = {r: i for i, r in enumerate(RELATION_TYPES)}
+# NO_REL is the 0th class (negative pairs); the 7 named relations follow.
+# Stage 2-004 fix: previously NUM_RELATIONS=7 and the loss only saw positive
+# pairs, so the head never learned to suppress negatives. Now NUM_RELATIONS=8
+# and every ordered pair of gold spans is a training example.
+NO_REL_ID = 0
+REL2ID = {"NO_REL": NO_REL_ID, **{r: i + 1 for i, r in enumerate(RELATION_TYPES)}}
 ID2REL = {i: r for r, i in REL2ID.items()}
-NUM_RELATIONS = len(RELATION_TYPES)
+NUM_RELATIONS = len(REL2ID)  # 8
 
 
 def _bio_tags_for_sentence(num_words: int, ner_spans: list) -> list[int]:

@@ -21,7 +21,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from data.scierc import BIO_TAG2ID, ID2BIO, NUM_RELATIONS, NUM_BIO_TAGS, ENTITY_TYPES
+from data.scierc import BIO_TAG2ID, ID2BIO, NUM_RELATIONS, NUM_BIO_TAGS, NO_REL_ID, ENTITY_TYPES
 
 
 def _bio_to_spans(bio_ids: list) -> list:
@@ -135,23 +135,18 @@ def evaluate(model, dataloader, device) -> dict:
             ner_fn += len(gold_ent_set - pred_ent_set)
 
             # ── 2. RE F1 on GOLD spans ───────────────────────────────
-            # Form all ordered pairs of distinct gold spans
+            # Form all ordered pairs of distinct gold spans, classify each,
+            # and DROP predictions of NO_REL (the model's "no relation" class).
             gold_span_list = [(s, e) for (s, e, _) in gold_ents]
             gold_pairs = [(a, b) for a in gold_span_list for b in gold_span_list if a != b]
             if gold_pairs:
                 re_logits = model.forward_re(hidden[b_idx], word_ids_list[b_idx], gold_pairs)
-                re_pred = re_logits.argmax(dim=-1).tolist()  # one prediction per pair
-                # Pred relations: keep predictions where score > 0 (always true for argmax)
-                # Stage 2a: every pair gets *some* predicted relation. We compare
-                # against the gold relation set.
-                pred_rel_triples = set()
-                for (h, t), pid in zip(gold_pairs, re_pred):
-                    pred_rel_triples.add((h, t, pid))
+                re_pred = re_logits.argmax(dim=-1).tolist()
+                pred_rel_triples = {
+                    (h, t, pid) for (h, t), pid in zip(gold_pairs, re_pred) if pid != NO_REL_ID
+                }
                 gold_rel_triples = {(h, t, rid) for (h, t, rid) in gold_rels}
                 re_tp += len(pred_rel_triples & gold_rel_triples)
-                # FP: predicted triples that don't match gold (note: this overcounts
-                # because we predict for ALL pairs; for Stage 2a baseline this is
-                # the honest number)
                 re_fp += len(pred_rel_triples - gold_rel_triples)
                 re_fn += len(gold_rel_triples - pred_rel_triples)
 
@@ -161,7 +156,9 @@ def evaluate(model, dataloader, device) -> dict:
             if pred_pairs:
                 pred_re_logits = model.forward_re(hidden[b_idx], word_ids_list[b_idx], pred_pairs)
                 pred_re_ids = pred_re_logits.argmax(dim=-1).tolist()
-                pred_full_triples = {(h, t, pid) for (h, t), pid in zip(pred_pairs, pred_re_ids)}
+                pred_full_triples = {
+                    (h, t, pid) for (h, t), pid in zip(pred_pairs, pred_re_ids) if pid != NO_REL_ID
+                }
             else:
                 pred_full_triples = set()
 

@@ -21,11 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel
 
-from data.scierc import NUM_BIO_TAGS, NUM_RELATIONS, BIO_TAG2ID, ID2BIO
-
-
-MAX_SPAN_WIDTH = 30  # word-level cap; SciERC spans are short, sentences max ~80 words
-WIDTH_EMB_DIM = 32
+from data.scierc import NUM_BIO_TAGS, NUM_RELATIONS, NO_REL_ID, BIO_TAG2ID, ID2BIO
 
 
 class BertKGExtractor(nn.Module):
@@ -37,19 +33,11 @@ class BertKGExtractor(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.ner_head = nn.Linear(hidden, NUM_BIO_TAGS)
 
-        # Stage 2-003: upgraded RE head with span features.
-        # Input features per pair:
-        #   head_repr   (H)   max-pooled head span embedding
-        #   tail_repr   (H)
-        #   head ⊙ tail (H)   element-wise product (interaction)
-        #   |head − tail| (H) absolute difference (asymmetry)
-        #   width_h     (W)   embedding of head span width (in words)
-        #   width_t     (W)   embedding of tail span width (in words)
-        # = 4H + 2W input dim
-        self.span_width_emb = nn.Embedding(MAX_SPAN_WIDTH + 1, WIDTH_EMB_DIM)
-        re_input_dim = hidden * 4 + WIDTH_EMB_DIM * 2
+        # Stage 2-004: revert to naive 2H concat RE head (same as 002),
+        # but pair it with the fixed loss that includes NO_REL negatives.
+        # Goal: isolate the loss-fix gain before re-adding head features.
         self.re_head = nn.Sequential(
-            nn.Linear(re_input_dim, hidden),
+            nn.Linear(hidden * 2, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, NUM_RELATIONS),
@@ -76,16 +64,6 @@ class BertKGExtractor(nn.Module):
             return hidden_states.new_zeros(hidden_states.size(-1))
         return hidden_states[token_idx].max(dim=0).values
 
-    def _width_id(self, span):
-        """Return clamped span-width id for embedding lookup."""
-        s, e = span  # inclusive
-        w = e - s + 1
-        if w < 1:
-            w = 1
-        if w > MAX_SPAN_WIDTH:
-            w = MAX_SPAN_WIDTH
-        return w  # 1..MAX_SPAN_WIDTH; index 0 unused
-
     def forward_re(self, hidden_states_b, word_ids_b, pairs):
         """
         For one example in the batch:
@@ -97,35 +75,31 @@ class BertKGExtractor(nn.Module):
         if not pairs:
             return hidden_states_b.new_zeros((0, NUM_RELATIONS))
         feats = []
-        device = hidden_states_b.device
         for (hs, he), (ts, te) in pairs:
             head_vec = self.span_repr(hidden_states_b, word_ids_b, (hs, he))
             tail_vec = self.span_repr(hidden_states_b, word_ids_b, (ts, te))
-            prod = head_vec * tail_vec
-            absdiff = (head_vec - tail_vec).abs()
-            wh = self.span_width_emb(torch.tensor(self._width_id((hs, he)), device=device))
-            wt = self.span_width_emb(torch.tensor(self._width_id((ts, te)), device=device))
-            feats.append(torch.cat([head_vec, tail_vec, prod, absdiff, wh, wt], dim=-1))
-        feats = torch.stack(feats, dim=0)  # (num_pairs, 4H + 2W)
+            feats.append(torch.cat([head_vec, tail_vec], dim=-1))
+        feats = torch.stack(feats, dim=0)  # (num_pairs, 2H)
         return self.re_head(self.dropout(feats))
 
 
 def compute_loss(model, batch, device, re_weight: float = 1.0):
     """
-    Compute Stage 2a loss = NER CE + re_weight · RE CE.
+    Compute Stage 2 loss = NER CE + re_weight · RE CE.
 
     NER: per-token cross entropy (ignore -100).
-    RE:  for each example, classify all GOLD entity span pairs.
-         Pairs without an annotated relation get a "no relation" label,
-         which we model as a 0 contribution by NOT including them
-         (Stage 2a — keep it simple, no negative sampling).
-         Pairs WITH a relation contribute CE loss against the gold rel id.
+    RE:  Stage 2-004 fix — enumerate ALL ordered pairs of gold entity spans.
+         Pairs that have an annotated relation get the rel id (1..7).
+         Pairs without an annotated relation get NO_REL_ID = 0.
+         This way the head learns to suppress the (vast majority of) pairs
+         that don't form a relation, instead of confabulating one.
     """
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
     ner_labels = batch["ner_labels"].to(device)
     word_ids_list = batch["word_ids"]
-    gold_relations = batch["gold_relations"]
+    gold_entities_list = batch["gold_entities"]
+    gold_relations_list = batch["gold_relations"]
 
     hidden = model.encode(input_ids, attention_mask)  # (B, T, H)
 
@@ -137,16 +111,34 @@ def compute_loss(model, batch, device, re_weight: float = 1.0):
         ignore_index=-100,
     )
 
-    # RE loss — only on examples that have at least one gold relation
+    # RE loss — every ordered pair of gold spans, NO_REL for unannotated pairs
     re_losses = []
-    for b_idx in range(len(gold_relations)):
-        rels = gold_relations[b_idx]
-        if not rels:
+    for b_idx in range(len(gold_entities_list)):
+        ents = gold_entities_list[b_idx]   # list of (s, e, type)
+        rels = gold_relations_list[b_idx]  # list of ((hs,he),(ts,te), rid)
+        if len(ents) < 2:
             continue
-        pairs = [(h, t) for (h, t, _) in rels]
-        targets = torch.tensor([rid for (_, _, rid) in rels], device=device, dtype=torch.long)
+
+        # Build a lookup of (head_span, tail_span) -> rel_id for positives
+        rel_lookup = {(h, t): rid for (h, t, rid) in rels}
+
+        # All ordered pairs of distinct gold spans
+        spans = [(s, e) for (s, e, _) in ents]
+        pairs = []
+        targets = []
+        for h in spans:
+            for t in spans:
+                if h == t:
+                    continue
+                pairs.append((h, t))
+                targets.append(rel_lookup.get((h, t), NO_REL_ID))
+
+        if not pairs:
+            continue
+
+        targets_t = torch.tensor(targets, device=device, dtype=torch.long)
         re_logits = model.forward_re(hidden[b_idx], word_ids_list[b_idx], pairs)
-        re_losses.append(F.cross_entropy(re_logits, targets))
+        re_losses.append(F.cross_entropy(re_logits, targets_t))
 
     if re_losses:
         re_loss = torch.stack(re_losses).mean()
