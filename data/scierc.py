@@ -150,6 +150,7 @@ class SciERCSentenceDataset(Dataset):
             "gold_entities": ex["ner"],          # list of (s, e, type_str)
             "gold_relations": ex["relations"],   # list of ((hs,he),(ts,te), rel_id)
             "num_words": len(words),
+            "words": words,                      # original word strings (for Stage 2b Decoder D triple lookup)
         }
 
 
@@ -176,6 +177,7 @@ def collate_fn(batch, pad_token_id: int = 0):
         "gold_entities": [b["gold_entities"] for b in batch],
         "gold_relations": [b["gold_relations"] for b in batch],
         "num_words": [b["num_words"] for b in batch],
+        "words": [b["words"] for b in batch],
     }
 
 
