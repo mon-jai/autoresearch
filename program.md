@@ -70,8 +70,13 @@ LOOP FOREVER (with strategic breakpoints):
    - L_rec crosses 0.5 / 0.1 / 0.01 → **Milestone** (mode-aware, see below)
      - Always: `python scripts/gen_report.py milestone <value>` and `git tag milestone-lrec-<value>`
      - If `$AUTORESEARCH_MODE == interactive` (default, daytime): **PAUSE** for human review
-     - If `$AUTORESEARCH_MODE == overnight`: **DO NOT PAUSE**. Invoke `/scientific-brainstorming` to list 3 candidate next directions within the current research family (margin / encoder / KBGAN / data), pick one with the strongest expected ROI, and resume LOOP. The human will review the report at Morning Review (07:00). Radical pivots are explicitly the human's call, not yours.
-10. Stuck 3+ experiments → **Knowledge Pipeline** (see below)
+     - If `$AUTORESEARCH_MODE == overnight`: **DO NOT PAUSE**. Follow this ordered procedure:
+       1. `/research-lookup` with a query specific to the current bottleneck (REQUIRED per plan §8). Ingest any useful paper to `wiki/raw/`.
+       2. `/scientific-brainstorming` to list 3 candidate next directions.
+       3. **In Stage 2 with the adversarial loop active (stage2c/d onwards), "mid-radical" variants are permitted** — reward shaping, LoRA rank, KL constraint, curriculum changes. Still not allowed: whole new dataset, new loss family, new architecture class. Those remain the human's call at Morning Review.
+       4. **In Stage 1 or pre-adversarial Stage 2**, stay conservative: only hyperparam sweeps within the current research family (margin / encoder / KBGAN / data tweaks).
+       5. Pick the strongest ROI candidate and resume LOOP. The human reviews at Morning Review (07:00).
+10. Stuck **2+** experiments → **Knowledge Pipeline** (see below). *Lowered from 3+ per STAGE2_MIGRATION_PLAN §8: Stage 1 triggered KP only once in 92 experiments — the old threshold was too lax. 2+ means we actually use the literature arsenal.*
 11. Knowledge Pipeline triggered 2+ times without improvement → **Stagnation** (pause)
 
 ## Knowledge Pipeline — Scientific Skills Integration
@@ -79,9 +84,10 @@ LOOP FOREVER (with strategic breakpoints):
 **This is the key extension beyond Karpathy's original design.** When stuck, you have a powerful arsenal of scientific skills. USE THEM.
 
 ### When to trigger
-- 3+ consecutive experiments without L_rec improvement
+- **2+** consecutive experiments without L_rec improvement (lowered from 3+; see plan §8)
 - After a Milestone breakpoint (to find next research direction)
 - When you run out of ideas
+- **Overnight mode: Milestone AND Stagnation breakpoints MUST run `/research-lookup` before picking a next direction.** The brainstorming call alone is no longer sufficient. Rationale: Stage 1 ran 92 experiments and ingested only 3 papers — brainstorming without fresh literature regresses to the same priors.
 
 ### Step 1: Search literature (USE SKILLS, NOT just WebSearch)
 
@@ -172,13 +178,19 @@ Each breakpoint type has specific skills that SHOULD be invoked:
 2. `/scientific-critical-thinking` — evaluate if techniques apply to our architecture
 3. Ingest papers → distill → apply insights
 
-**Milestone reached (L_rec breakthrough):**
+**Milestone reached (L_rec breakthrough or Triple F1 jump):**
 1. `/scientific-writing` — write structured milestone report
-2. `/scientific-visualization` — generate L_rec trajectory plot
-3. `/research-lookup` — find papers for next research direction
+2. `/scientific-visualization` — generate trajectory plot
+3. **`/research-lookup` — REQUIRED** (plan §8). Find papers for next research direction. Ingest promising ones to `wiki/raw/`.
 4. **Mode-aware continuation** (check `$AUTORESEARCH_MODE`):
    - `interactive` (default): PAUSE for human review
-   - `overnight`: DO NOT pause. Run `/scientific-brainstorming` to list 3 candidate next directions **within the current research family** (margin / encoder / KBGAN / data tweaks). Pick the strongest expected ROI and resume the loop. Radical pivots (whole new paradigm) are reserved for the human at Morning Review — do not attempt them yourself overnight.
+   - `overnight`: DO NOT pause. Run `/scientific-brainstorming` to list 3 candidate next directions. **In Stage 2 adversarial phase**, mid-radical variants (reward shape, LoRA rank, KL constraint, curriculum) are permitted. **In Stage 1 or pre-adversarial Stage 2**, stay within the current research family only. Whole-paradigm pivots are reserved for the human at Morning Review.
+
+**Morning Review (daily 07:00 breakpoint):**
+The daily report in `reports/daily/morning_YYYY-MM-DD.md` **MUST** include (plan §8):
+- A "Literature ingested overnight" section listing papers searched and added to `wiki/raw/`, with key insights per paper.
+- If 0 papers were searched during the night, the report must explain why (e.g. "no Knowledge Pipeline triggered; 12 experiments all improved").
+- The usual trajectory plot + experiment summary.
 
 **Stagnation (deep stuck):**
 1. `/scientific-brainstorming` — radical ideation session
@@ -194,4 +206,7 @@ Between breakpoints, you are fully autonomous. Do NOT pause to ask the human. Do
 Read the `AUTORESEARCH_MODE` environment variable at session start (default: `interactive`).
 
 - **`interactive`** (daytime, human in the loop): Milestone breakpoint pauses so the human can review and steer. This is the default and matches Karpathy's original design.
-- **`overnight`** (set by `scripts/run_overnight.sh`): No human will respond until 07:00. Milestone is **soft** — write the report, tag the commit, run `/scientific-brainstorming` to pick the next direction within the current research family, and resume the loop. The only hard stop overnight is the Morning Review breakpoint at 07:00. Radical pivots remain a human decision; you do conservative pivots only.
+- **`overnight`** (set by `scripts/run_overnight.sh`): No human will respond until 07:00. Milestone is **soft** — write the report, tag the commit, then **required** `/research-lookup` → `/scientific-brainstorming` → pick next direction → resume the loop. The only hard stop overnight is the Morning Review breakpoint at 07:00. Per plan §8:
+  - **Stage 1 / pre-adversarial Stage 2**: conservative pivots only (within current research family).
+  - **Stage 2 adversarial (stage2c/d onwards)**: mid-radical variants permitted (reward shape, LoRA rank, KL, curriculum). Whole-paradigm pivots remain human-only.
+  - Every Morning Review report must contain a literature-ingested section (0 papers requires an explanation).
