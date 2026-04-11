@@ -20,7 +20,7 @@ from pathlib import Path
 
 import torch
 from torch.optim import AdamW
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from data.scierc import build_dataloaders, NUM_BIO_TAGS, NUM_RELATIONS
 from models.bert_kg_encoder import BertKGExtractor, compute_loss
@@ -34,6 +34,9 @@ def parse_args():
     p.add_argument("--max-length", type=int, default=128)
     p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument("--max-steps", type=int, default=200)
+    p.add_argument("--warmup-steps", type=int, default=0,
+                   help="Linear warmup from 0 to lr over this many steps. "
+                        "Stage 2-005 default: 100. Stage 2-001..004 used 0.")
     p.add_argument("--re-weight", type=float, default=1.0)
     p.add_argument("--eval-every", type=int, default=50)
     p.add_argument("--data-dir", default=None, help="Path to SciERC json files")
@@ -69,7 +72,21 @@ def main():
     model = BertKGExtractor(args.model_name).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 
+    # Stage 2-005: linear warmup → linear decay scheduler.
+    # If --warmup-steps == 0, the schedule is just linear decay (still helpful).
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=args.max_steps,
+    )
+    print(f"  warmup: {args.warmup_steps} | scheduler: linear decay to 0")
+
     # ── Train loop ───────────────────────────────────────────────────
+    # Stage 2-005: track best dev metric so we can report best-checkpoint
+    # alongside final-checkpoint, like every published SciERC baseline does.
+    best_metrics = {"triple_f1": -1.0}
+    best_step = -1
+
     model.train()
     step = 0
     train_iter = iter(train_loader)
@@ -87,19 +104,26 @@ def main():
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        scheduler.step()
 
         if step % 10 == 0:
             dt = (time.time() - t0) * 1000 / max(step, 1)
-            print(f"[Step {step:04d}] L_total={loss.item():.4f} | L_ner={ner_loss.item():.4f} | L_re={re_loss.item():.4f} | {dt:.1f}ms/step")
+            cur_lr = scheduler.get_last_lr()[0]
+            print(f"[Step {step:04d}] L_total={loss.item():.4f} | L_ner={ner_loss.item():.4f} | L_re={re_loss.item():.4f} | lr={cur_lr:.2e} | {dt:.1f}ms/step")
 
         if step > 0 and step % args.eval_every == 0:
             model.eval()
             metrics = evaluate(model, dev_loader, device)
+            star = ""
+            if metrics["triple_f1"] > best_metrics["triple_f1"]:
+                best_metrics = dict(metrics)
+                best_step = step
+                star = " ★ NEW BEST"
             print(f"[Eval @ step {step}] "
                   f"NER F1={metrics['ner_f1']:.4f} | "
                   f"RE F1={metrics['re_f1']:.4f} | "
                   f"Triple F1={metrics['triple_f1']:.4f} | "
-                  f"({metrics['n_gold_triples']} gold triples on {metrics['n_examples']} sentences)")
+                  f"({metrics['n_gold_triples']} gold triples on {metrics['n_examples']} sentences){star}")
             model.train()
 
         step += 1
@@ -107,10 +131,17 @@ def main():
     # Final eval
     model.eval()
     metrics = evaluate(model, dev_loader, device)
-    print(f"\n=== FINAL ===")
+    if metrics["triple_f1"] > best_metrics["triple_f1"]:
+        best_metrics = dict(metrics)
+        best_step = step
+    print(f"\n=== FINAL (step {step}) ===")
     print(f"  NER F1     = {metrics['ner_f1']:.4f}")
     print(f"  RE F1      = {metrics['re_f1']:.4f}")
     print(f"  Triple F1  = {metrics['triple_f1']:.4f}")
+    print(f"=== BEST DEV (step {best_step}, by Triple F1) ===")
+    print(f"  NER F1     = {best_metrics['ner_f1']:.4f}")
+    print(f"  RE F1      = {best_metrics['re_f1']:.4f}")
+    print(f"  Triple F1  = {best_metrics['triple_f1']:.4f}")
     print(f"  Total time = {time.time() - t0:.1f}s")
 
 
