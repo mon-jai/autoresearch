@@ -1,0 +1,2 @@
+commit	exp_id	steps	ner_f1	re_f1_gold	triple_f1	status	description
+d65196a	stage2-001	500	0.5896	0.2616	0.1070	keep	baseline: BERT-base + SciERC + supervised NER+RE, bs=16, lr=3e-5 (56s on DGX). NER F1 still rising at step 500, not converged. First real-data result after Stage 1 migration.
