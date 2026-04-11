@@ -197,3 +197,43 @@ def l_rec_batch(
         for s, t in zip(sentences, source_triples)
     ]
     return torch.tensor(out, device=device, dtype=torch.float32)
+
+
+# ── String containment reward (Stage 2d v3) ─────────────────────────
+# Replaces L_rec-based β term. Directly checks whether the decoder's
+# output mentions the source entities. More robust than encoder-based
+# L_rec, which returns ~4.0 even on successful span matches because the
+# frozen encoder can't extract triples from Qwen paraphrases.
+
+
+def _substr_in(phrase: str, text: str) -> bool:
+    """Case-insensitive substring check."""
+    return phrase.lower().strip() in text.lower()
+
+
+def string_containment_reward_single(
+    sentence: str,
+    source_triple: Tuple[str, str, str],
+) -> float:
+    """
+    Returns 1.0 if both head and tail appear in sentence,
+    0.5 if exactly one appears, 0.0 if neither.
+    """
+    head, _rel, tail = source_triple
+    h = _substr_in(head, sentence)
+    t = _substr_in(tail, sentence)
+    return 0.5 * float(h) + 0.5 * float(t)
+
+
+def string_containment_batch(
+    sentences: List[str],
+    source_triples: List[Tuple[str, str, str]],
+    device: str,
+) -> torch.Tensor:
+    """Returns (B,) float tensor of containment rewards in [0, 0.5, 1.0]."""
+    assert len(sentences) == len(source_triples)
+    out = [
+        string_containment_reward_single(s, t)
+        for s, t in zip(sentences, source_triples)
+    ]
+    return torch.tensor(out, device=device, dtype=torch.float32)

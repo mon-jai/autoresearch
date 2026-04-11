@@ -53,7 +53,7 @@ def parse_args():
     p.add_argument("--alpha", type=float, default=1.0,
                    help="Weight on tanh(critic_logit/3). Zeroed in Phase A.")
     p.add_argument("--beta", type=float, default=1.0,
-                   help="Weight on (1 − L_rec/scale).")
+                   help="Weight on β term (string containment or L_rec).")
     p.add_argument("--gamma", type=float, default=0.05,
                    help="KL penalty weight (weak; hard clip is the main safeguard).")
     p.add_argument("--eta", type=float, default=0.01,
@@ -61,6 +61,9 @@ def parse_args():
     p.add_argument("--l-rec-scale", type=float, default=4.0)
     p.add_argument("--kl-max", type=float, default=10.0,
                    help="Hard KL constraint: skip REINFORCE step if kl.mean() exceeds this.")
+    p.add_argument("--beta-mode", default="string",
+                   choices=["string", "encoder"],
+                   help="β term: 'string' = entity containment (v3), 'encoder' = L_rec (v1/v2).")
     # LoRA config
     p.add_argument("--lora-r", type=int, default=8)
     p.add_argument("--lora-alpha", type=int, default=16)
@@ -119,7 +122,10 @@ def main():
     print(f"  stage2b ckpt:     {args.stage2b_ckpt}")
     print(f"  phases:           A={args.phase_a_steps} (β-only) | B={args.phase_b_steps} (α+β) | total={total_steps}")
     print(f"  LoRA:             r={args.lora_r} α={args.lora_alpha} dropout={args.lora_dropout}")
-    print(f"  reward:           α={args.alpha}·tanh(crit/3) + β={args.beta}·(1−L_rec/{args.l_rec_scale})")
+    beta_desc = (f"β={args.beta}·string_containment" if args.beta_mode == "string"
+                 else f"β={args.beta}·(1−L_rec/{args.l_rec_scale})")
+    print(f"  reward:           α={args.alpha}·tanh(crit/3) + {beta_desc}")
+    print(f"  β mode:           {args.beta_mode}")
     print(f"  KL:               γ={args.gamma}  KL_MAX={args.kl_max}")
     print(f"  entropy bonus η:  {args.eta}")
 
@@ -187,12 +193,21 @@ def main():
         lora_lp = sampled["lora_logprob"]     # (B,) grad
         kl = sampled["kl"]                     # (B,) grad
 
-        # ── β term: (1 − L_rec(E(synth), source_triple) / scale) ──
-        l_rec = er_mod.l_rec_batch(
-            model, synth_sentences, triples, tokenizer, device,
-            max_length=args.max_length, max_loss=args.l_rec_scale,
-        )
-        rec_reward = torch.clamp(1.0 - l_rec / args.l_rec_scale, min=0.0, max=1.0)
+        # ── β term ──
+        if args.beta_mode == "string":
+            # v3: direct string containment — robust, no encoder dependency
+            rec_reward = er_mod.string_containment_batch(
+                synth_sentences, triples, device,
+            )
+            l_rec_diag = rec_reward.clone()   # diagnostic only (1.0 = both found)
+        else:
+            # v1/v2: encoder-based L_rec (fragile on Qwen paraphrases)
+            l_rec = er_mod.l_rec_batch(
+                model, synth_sentences, triples, tokenizer, device,
+                max_length=args.max_length, max_loss=args.l_rec_scale,
+            )
+            rec_reward = torch.clamp(1.0 - l_rec / args.l_rec_scale, min=0.0, max=1.0)
+            l_rec_diag = l_rec.clone()
 
         # ── α term: tanh(critic_logit / 3) ────────────────────────
         with torch.no_grad():
@@ -237,7 +252,7 @@ def main():
                 f"reward={rewards.mean().item():+.3f} "
                 f"(α·crit={cur_alpha * critic_reward.mean().item():+.3f} "
                 f"β·rec={args.beta * rec_reward.mean().item():+.3f}) "
-                f"L_rec={l_rec.mean().item():.2f} "
+                f"diag={l_rec_diag.mean().item():.3f} "
                 f"kl={kl_mean.item():+.2f} "
                 f"loss={loss.item():+.3f} "
                 f"lr={cur_lr:.2e} | {dt:.0f}ms/step "
