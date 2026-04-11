@@ -1,15 +1,14 @@
 """
-Stage 2b Decoder D — frozen LLM that paraphrases (head, relation, tail) triples
-into natural scientific sentences.
+Decoder D — the LLM that paraphrases (head, relation, tail) triples into
+natural scientific sentences.
 
-NO gradients flow through this. Stage 2c will subclass / replace this with a
-LoRA-tunable version. Stage 2b's job is just to produce sentences for the
-critic to compare against held-out arXiv text.
+This file defines the shared base class (`QwenDecoderBase`) plus the Stage 2b
+frozen variant (`FrozenQwenDecoder`). The Stage 2c LoRA-tunable variant lives
+in `models/decoder_d_lora.py` and inherits from `QwenDecoderBase`.
 
 Default model: Qwen/Qwen2.5-0.5B-Instruct
 - 500M params, fits easily on GB10 alongside SciBERT + critic
 - Instruct-tuned → handles the prompt template well
-- Validated on the DGX env (qwen family is the workhorse for this project)
 """
 from typing import List, Tuple
 
@@ -43,20 +42,26 @@ def humanize_relation(rel: str) -> str:
     return RELATION_PHRASES.get(rel, rel.lower().replace("-", " "))
 
 
-class FrozenQwenDecoder:
+class QwenDecoderBase:
     """
-    Wraps a frozen instruction-tuned Qwen model. Call .generate_batch() to
-    produce paraphrases of (head, rel, tail) triples.
+    Shared base for FrozenQwenDecoder (Stage 2b) and LoRAQwenDecoder (Stage 2c).
 
-    Stage 2b uses this purely as a fixed text source. Stage 2c will replace
-    or subclass to allow LoRA gradients.
+    Responsibilities:
+      - tokenizer setup (left-padding for decoder-only batched generate)
+      - model load with dtype + device
+      - prompt building from (h, r, t) triples
+      - generate_batch() for inference-only text sampling
+      - decode_new_tokens() helper for post-processing
+
+    Subclasses decide whether base params are frozen (Stage 2b) and whether
+    to add trainable adapters (Stage 2c LoRA).
     """
 
     def __init__(
         self,
         model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
         device: str = "cuda",
-        dtype: torch.dtype = torch.bfloat16,
+        dtype: "torch.dtype" = torch.bfloat16,
     ):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token_id is None:
@@ -68,10 +73,39 @@ class FrozenQwenDecoder:
             model_name,
             torch_dtype=dtype,
         ).to(device)
-        self.model.eval()
-        for p in self.model.parameters():
-            p.requires_grad = False
         self.device = device
+
+    # ---- prompt / decode helpers --------------------------------------
+
+    def build_prompts(self, triples: List[Tuple[str, str, str]]) -> List[str]:
+        return [
+            PROMPT_TEMPLATE.format(head=h, rel=humanize_relation(r), tail=t)
+            for (h, r, t) in triples
+        ]
+
+    def encode_prompts(self, prompts: List[str], max_length: int = 128):
+        return self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+        ).to(self.device)
+
+    def decode_new_tokens(self, generated, prompt_len: int) -> List[str]:
+        """Strip prompt prefix, keep first line, cap length, avoid empty."""
+        sentences = []
+        for gen in generated:
+            new_tokens = gen[prompt_len:]
+            sent = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            sent = sent.strip().split("\n")[0]
+            sent = sent[:300]
+            if not sent:
+                sent = "."
+            sentences.append(sent)
+        return sentences
+
+    # ---- inference-only path ------------------------------------------
 
     @torch.no_grad()
     def generate_batch(
@@ -87,19 +121,8 @@ class FrozenQwenDecoder:
         """
         if not triples:
             return []
-
-        prompts = [
-            PROMPT_TEMPLATE.format(head=h, rel=humanize_relation(r), tail=t)
-            for (h, r, t) in triples
-        ]
-        enc = self.tokenizer(
-            prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=128,
-        ).to(self.device)
-
+        prompts = self.build_prompts(triples)
+        enc = self.encode_prompts(prompts)
         out = self.model.generate(
             **enc,
             max_new_tokens=max_new_tokens,
@@ -108,17 +131,23 @@ class FrozenQwenDecoder:
             top_p=top_p,
             pad_token_id=self.tokenizer.pad_token_id,
         )
+        return self.decode_new_tokens(out, prompt_len=enc["input_ids"].shape[1])
 
-        # Strip the prompt portion of each output
-        prompt_len = enc["input_ids"].shape[1]
-        sentences = []
-        for gen in out:
-            new_tokens = gen[prompt_len:]
-            sent = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
-            sent = sent.strip().split("\n")[0]  # first line only
-            sent = sent[:300]  # safety cap
-            if not sent:
-                sent = "."  # never return empty string (would break tokenization)
-            sentences.append(sent)
 
-        return sentences
+class FrozenQwenDecoder(QwenDecoderBase):
+    """
+    Stage 2b: all params frozen, no gradients ever flow through.
+    Behavior is identical to the pre-refactor class — only the code lives
+    in the base class now.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
+        device: str = "cuda",
+        dtype: "torch.dtype" = torch.bfloat16,
+    ):
+        super().__init__(model_name=model_name, device=device, dtype=dtype)
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad = False

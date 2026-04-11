@@ -66,6 +66,10 @@ def parse_args():
     p.add_argument("--arxiv-jsonl", default=None)
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--save-best-to", default=None,
+                   help="If set, save encoder+critic weights to this path "
+                        "whenever dev Triple F1 is a new best. Used by Stage "
+                        "2c to get a frozen recovery encoder.")
     return p.parse_args()
 
 
@@ -249,6 +253,17 @@ def main():
                 best_metrics = dict(metrics)
                 best_step = step
                 star = " ★ NEW BEST"
+                if args.save_best_to:
+                    save_path = Path(args.save_best_to)
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save({
+                        "encoder": model.state_dict(),
+                        "critic": critic.state_dict(),
+                        "step": step,
+                        "metrics": metrics,
+                        "args": vars(args),
+                    }, save_path)
+                    star += f" (ckpt→{save_path})"
             print(
                 f"[Eval @ step {step}] "
                 f"NER F1={metrics['ner_f1']:.4f} | "
