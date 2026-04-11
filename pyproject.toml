@@ -14,6 +14,10 @@ dependencies = [
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
     "torch==2.9.1",
+    # Stage 2 (SciERC + BERT KG extraction)
+    "transformers>=4.46.0",
+    "datasets>=3.0.0",
+    "seqeval>=1.2.2",
 ]
 
 [tool.uv.sources]
