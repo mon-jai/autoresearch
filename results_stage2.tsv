@@ -1,3 +1,4 @@
 commit	exp_id	steps	ner_f1	re_f1_gold	triple_f1	status	description
 d65196a	stage2-001	500	0.5896	0.2616	0.1070	keep	baseline: BERT-base + SciERC + supervised NER+RE, bs=16, lr=3e-5 (56s on DGX). NER F1 still rising at step 500, not converged. First real-data result after Stage 1 migration.
 612bb76	stage2-001b	2000	0.6261	0.2508	0.1163	keep	same as 001 but 2000 steps (219s). NER F1 plateau at ~0.63 by step 1000; peak at step 1400 (NER 0.639, Triple 0.128). RE F1 stuck at 0.25-0.27 throughout. Train loss → 0.02 = clear overfitting after step 1700. Ceiling for BERT-base + naive heads identified.
+7cd64ac	stage2-002	1400	0.6380	0.2691	0.1341	keep	swap bert-base-uncased → allenai/scibert_scivocab_uncased. 1400 steps (151s). PEAK at step 800 (NER 0.653, Triple 0.136), 600 steps EARLIER than BERT-base. Final at 1400 also competitive. Confirms (a) SciBERT small NER win +0.014, (b) RE F1 still locked at 0.27 — RE head is the real bottleneck, not backbone.
