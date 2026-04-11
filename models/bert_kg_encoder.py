@@ -24,6 +24,10 @@ from transformers import AutoModel
 from data.scierc import NUM_BIO_TAGS, NUM_RELATIONS, BIO_TAG2ID, ID2BIO
 
 
+MAX_SPAN_WIDTH = 30  # word-level cap; SciERC spans are short, sentences max ~80 words
+WIDTH_EMB_DIM = 32
+
+
 class BertKGExtractor(nn.Module):
     def __init__(self, model_name: str = "bert-base-uncased", dropout: float = 0.1):
         super().__init__()
@@ -32,10 +36,20 @@ class BertKGExtractor(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
         self.ner_head = nn.Linear(hidden, NUM_BIO_TAGS)
-        # Span representation: concat of head + tail span max-pooled embeddings.
-        # Stage 2a uses simple concat; later stages can swap in better span repr.
+
+        # Stage 2-003: upgraded RE head with span features.
+        # Input features per pair:
+        #   head_repr   (H)   max-pooled head span embedding
+        #   tail_repr   (H)
+        #   head ⊙ tail (H)   element-wise product (interaction)
+        #   |head − tail| (H) absolute difference (asymmetry)
+        #   width_h     (W)   embedding of head span width (in words)
+        #   width_t     (W)   embedding of tail span width (in words)
+        # = 4H + 2W input dim
+        self.span_width_emb = nn.Embedding(MAX_SPAN_WIDTH + 1, WIDTH_EMB_DIM)
+        re_input_dim = hidden * 4 + WIDTH_EMB_DIM * 2
         self.re_head = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
+            nn.Linear(re_input_dim, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, NUM_RELATIONS),
@@ -62,6 +76,16 @@ class BertKGExtractor(nn.Module):
             return hidden_states.new_zeros(hidden_states.size(-1))
         return hidden_states[token_idx].max(dim=0).values
 
+    def _width_id(self, span):
+        """Return clamped span-width id for embedding lookup."""
+        s, e = span  # inclusive
+        w = e - s + 1
+        if w < 1:
+            w = 1
+        if w > MAX_SPAN_WIDTH:
+            w = MAX_SPAN_WIDTH
+        return w  # 1..MAX_SPAN_WIDTH; index 0 unused
+
     def forward_re(self, hidden_states_b, word_ids_b, pairs):
         """
         For one example in the batch:
@@ -73,11 +97,16 @@ class BertKGExtractor(nn.Module):
         if not pairs:
             return hidden_states_b.new_zeros((0, NUM_RELATIONS))
         feats = []
+        device = hidden_states_b.device
         for (hs, he), (ts, te) in pairs:
             head_vec = self.span_repr(hidden_states_b, word_ids_b, (hs, he))
             tail_vec = self.span_repr(hidden_states_b, word_ids_b, (ts, te))
-            feats.append(torch.cat([head_vec, tail_vec], dim=-1))
-        feats = torch.stack(feats, dim=0)  # (num_pairs, 2H)
+            prod = head_vec * tail_vec
+            absdiff = (head_vec - tail_vec).abs()
+            wh = self.span_width_emb(torch.tensor(self._width_id((hs, he)), device=device))
+            wt = self.span_width_emb(torch.tensor(self._width_id((ts, te)), device=device))
+            feats.append(torch.cat([head_vec, tail_vec, prod, absdiff, wh, wt], dim=-1))
+        feats = torch.stack(feats, dim=0)  # (num_pairs, 4H + 2W)
         return self.re_head(self.dropout(feats))
 
 
