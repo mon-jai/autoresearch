@@ -56,25 +56,87 @@ def _bio_to_spans(bio_ids: list) -> list:
     return spans
 
 
+def _is_valid_bio_transition(prev_tag_id: int, cand_tag_id: int) -> bool:
+    """
+    Stage 2-006: BIO transition constraint.
+    Valid:   anything → O
+             anything → B-X
+             B-X      → I-X
+             I-X      → I-X
+    Invalid: O   → I-X
+             B-X → I-Y  (Y != X)
+             I-X → I-Y  (Y != X)
+    """
+    cand = ID2BIO[cand_tag_id]
+    if cand == "O" or cand.startswith("B-"):
+        return True
+    # cand starts with "I-"
+    cand_type = cand[2:]
+    prev = ID2BIO[prev_tag_id]
+    return prev == f"B-{cand_type}" or prev == f"I-{cand_type}"
+
+
+def _word_level_emissions(token_logits, word_ids):
+    """
+    Aggregate per-token logits into per-word emissions by taking the
+    first subword's logits for each word. Returns a list of length
+    (num_unique_words), each element shape (NUM_BIO_TAGS,).
+    """
+    seen = set()
+    word_emissions: dict = {}
+    for i, wid in enumerate(word_ids):
+        if wid is None or wid in seen:
+            continue
+        word_emissions[wid] = token_logits[i]
+        seen.add(wid)
+    if not word_emissions:
+        return []
+    max_wid = max(word_emissions.keys())
+    out = []
+    for w in range(max_wid + 1):
+        if w in word_emissions:
+            out.append(word_emissions[w])
+        else:
+            # Word missing (shouldn't happen with HF tokenizer + is_split_into_words=True)
+            # Default to O — make a fake one-hot zero vector with O dominant
+            zero = token_logits[0] * 0
+            zero[BIO_TAG2ID["O"]] = 1.0
+            out.append(zero)
+    return out
+
+
 def _word_level_bio_from_token_logits(token_logits, word_ids):
     """
+    Stage 2-006: BIO-constrained greedy decoding (Viterbi-equivalent without
+    transition scores). For each word, pick the highest-scoring tag whose
+    transition from the previous tag is valid.
+
+    Equivalent to plain argmax when there are no constraint violations,
+    so this can ONLY improve metrics, never hurt them.
+
     token_logits: (T, NUM_BIO_TAGS) raw logits for one example
     word_ids:     list[int|None] length T
-    Returns: list of word-level BIO tag ids (length = num unique non-None word ids)
+    Returns: list of word-level BIO tag ids
     """
-    pred_token = token_logits.argmax(dim=-1).tolist()  # length T
-
-    # Take the first subword's prediction for each word
-    word_bio = {}
-    for i, wid in enumerate(word_ids):
-        if wid is None:
-            continue
-        if wid not in word_bio:
-            word_bio[wid] = pred_token[i]
-    if not word_bio:
+    word_emissions = _word_level_emissions(token_logits, word_ids)
+    if not word_emissions:
         return []
-    max_wid = max(word_bio.keys())
-    return [word_bio.get(w, BIO_TAG2ID["O"]) for w in range(max_wid + 1)]
+
+    O_id = BIO_TAG2ID["O"]
+    out = []
+    prev_tag = O_id  # virtual start-of-sequence = O
+    for emission in word_emissions:
+        # Sort tag indices by score descending
+        scores = emission.tolist()
+        ranked = sorted(range(len(scores)), key=lambda t: scores[t], reverse=True)
+        chosen = O_id
+        for cand in ranked:
+            if _is_valid_bio_transition(prev_tag, cand):
+                chosen = cand
+                break
+        out.append(chosen)
+        prev_tag = chosen
+    return out
 
 
 def _prf(tp: int, fp: int, fn: int):
