@@ -296,6 +296,11 @@ def main():
     print(f"  Triple F1 = {best_metrics['triple_f1']:.4f}")
     print(f"  kl_clips  = {kl_clip_count}")
     print(f"  total time= {time.time() - t0:.1f}s")
+    # Always save the final LoRA (the "best" save only fires on encoder
+    # F1 improvement, which never happens when the encoder is frozen).
+    final_path = args.save_adapters_to + "_final"
+    decoder.save_adapters(final_path)
+    print(f"  final lora saved → {final_path}")
 
 
 if __name__ == "__main__":
