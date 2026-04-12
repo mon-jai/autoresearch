@@ -63,6 +63,11 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--min-containment", type=float, default=1.0,
                    help="Load-time filter on synth containment score.")
+    p.add_argument("--use-crf", action="store_true",
+                   help="Add CRF layer on NER head (stage2-012). Negative result — not recommended.")
+    p.add_argument("--adv-epsilon", type=float, default=0.0,
+                   help="FGM adversarial perturbation epsilon on word embeddings. "
+                        "0 = disabled. Recommended: 0.5-1.0 (READ-style).")
     p.add_argument("--save-best-to", default=None)
     return p.parse_args()
 
@@ -111,7 +116,9 @@ def main():
         print(f"  synth:     {len(synth_loader.dataset)} sentences")
 
     # ── Model ───────────────────────────────────────────────────
-    model = BertKGExtractor(args.model_name).to(device)
+    model = BertKGExtractor(args.model_name, use_crf=args.use_crf).to(device)
+    if args.use_crf:
+        print(f"  CRF:       enabled ({sum(p.numel() for p in model.crf.parameters())} params)")
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
@@ -152,6 +159,25 @@ def main():
             total = gold_loss
 
         total.backward()
+
+        # ── FGM adversarial perturbation (READ-style) ──────────
+        if args.adv_epsilon > 0:
+            # Collect word embedding params and their gradients
+            emb = model.backbone.bert.embeddings.word_embeddings.weight
+            if emb.grad is not None:
+                # FGM: perturbation = epsilon * grad / ||grad||
+                norm = emb.grad.norm()
+                if norm > 0 and not torch.isnan(norm):
+                    r_adv = args.adv_epsilon * emb.grad / norm
+                    emb.data.add_(r_adv)
+                    # Re-forward on gold batch with perturbed embeddings
+                    adv_loss, _, _, _ = compute_loss(
+                        model, gold_batch, device, re_weight=args.re_weight,
+                    )
+                    adv_loss.backward()
+                    # Restore original embeddings
+                    emb.data.sub_(r_adv)
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         scheduler.step()

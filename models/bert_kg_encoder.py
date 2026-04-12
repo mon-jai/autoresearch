@@ -112,13 +112,23 @@ class BertKGExtractor(nn.Module):
     register ImageAdapter, TableAdapter, etc. without touching this class.
     """
 
-    def __init__(self, model_name: str = "bert-base-uncased", dropout: float = 0.1):
+    def __init__(self, model_name: str = "bert-base-uncased", dropout: float = 0.1,
+                 use_crf: bool = False):
         super().__init__()
         self.backbone = BertBackbone(model_name)
         hidden = self.backbone.hidden_size
 
         self.dropout = nn.Dropout(dropout)
         self.ner_head = nn.Linear(hidden, NUM_BIO_TAGS)
+
+        # Optional CRF layer for NER (stage2-012). When enabled, NER loss
+        # uses CRF negative log-likelihood instead of per-token CE, and
+        # decoding uses Viterbi instead of greedy BIO-constrained argmax.
+        self.use_crf = use_crf
+        self.crf = None
+        if use_crf:
+            from torchcrf import CRF
+            self.crf = CRF(NUM_BIO_TAGS, batch_first=True)
 
         # Stage 2-004 RE head — naive 2H concat + 2-layer MLP. Refactored body
         # but the same math as before; stage2-004 numbers must reproduce.
@@ -236,11 +246,21 @@ def compute_loss(model, batch, device, re_weight: float = 1.0):
 
     # NER loss
     ner_logits = model.forward_ner(hidden)
-    ner_loss = F.cross_entropy(
-        ner_logits.view(-1, ner_logits.size(-1)),
-        ner_labels.view(-1),
-        ignore_index=-100,
-    )
+    if model.use_crf and model.crf is not None:
+        # CRF requires: (1) mask first timestep = True, (2) no -100 in tags.
+        # Use attention_mask as the CRF mask (first token [CLS] is always 1).
+        # Replace -100 labels with O-tag (0) — CRF mask will handle ignoring
+        # special tokens; the O-tag assignment is just to keep tags in-range.
+        crf_mask = attention_mask.bool()  # (B, T)
+        crf_labels = ner_labels.clone()
+        crf_labels[ner_labels == -100] = 0  # O tag
+        ner_loss = -model.crf(ner_logits, crf_labels, mask=crf_mask, reduction="mean")
+    else:
+        ner_loss = F.cross_entropy(
+            ner_logits.view(-1, ner_logits.size(-1)),
+            ner_labels.view(-1),
+            ignore_index=-100,
+        )
 
     # RE loss — every ordered pair of gold spans, NO_REL for unannotated pairs
     re_losses = []

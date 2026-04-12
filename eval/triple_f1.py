@@ -177,6 +177,13 @@ def evaluate(model, dataloader, device) -> dict:
         hidden = model.encode(modality="text", input_ids=input_ids, attention_mask=attention_mask)
         ner_logits = model.forward_ner(hidden)  # (B, T, C)
 
+        # CRF Viterbi decode (batch-level) if available; otherwise per-example greedy.
+        crf_decoded = None
+        if getattr(model, "use_crf", False) and model.crf is not None:
+            # CRF.decode needs a mask; use attention_mask (True = valid token).
+            crf_mask = attention_mask.bool()
+            crf_decoded = model.crf.decode(ner_logits, mask=crf_mask)  # list of list[int]
+
         for b_idx in range(input_ids.size(0)):
             n_examples += 1
             num_words = num_words_list[b_idx]
@@ -187,7 +194,20 @@ def evaluate(model, dataloader, device) -> dict:
             n_gold_triples += len(gold_rels)
 
             # ── 1. NER F1 ────────────────────────────────────────────
-            word_bio = _word_level_bio_from_token_logits(ner_logits[b_idx], word_ids_list[b_idx])
+            if crf_decoded is not None:
+                # CRF gives token-level tag ids; convert to word-level.
+                token_tags = crf_decoded[b_idx]
+                wids = word_ids_list[b_idx]
+                word_bio = []
+                seen = set()
+                for tok_i, wid in enumerate(wids):
+                    if wid is None or wid in seen:
+                        continue
+                    if tok_i < len(token_tags):
+                        word_bio.append(token_tags[tok_i])
+                    seen.add(wid)
+            else:
+                word_bio = _word_level_bio_from_token_logits(ner_logits[b_idx], word_ids_list[b_idx])
             pred_spans = _bio_to_spans(word_bio)
             pred_ent_set = {(s, e, t) for (s, e, t) in pred_spans}
             gold_ent_set = {(s, e, t) for (s, e, t) in gold_ents}
