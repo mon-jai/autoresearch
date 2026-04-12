@@ -74,7 +74,13 @@ def parse_args():
     p.add_argument("--arxiv-jsonl", default=None)
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--save-adapters-to", default="checkpoints/stage2_009_lora")
+    p.add_argument("--save-adapters-to", default=None,
+                   help="Where to save LoRA adapters. If None, defaults to "
+                        "checkpoints/stage2_009_lora_<tag> where <tag> is the "
+                        "CLI-derived variant tag. Pass explicit path to override.")
+    p.add_argument("--variant-tag", default="default",
+                   help="Variant identifier (e.g. v7, r16_lr1e6). Used only "
+                        "when --save-adapters-to is None to build the default path.")
     return p.parse_args()
 
 
@@ -113,6 +119,11 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed)
     random.seed(args.seed)
+
+    # Fill in variant-aware default for adapter save path so that
+    # ablation runs (v5, v6, v7...) don't silently overwrite each other.
+    if args.save_adapters_to is None:
+        args.save_adapters_to = f"checkpoints/stage2_009_lora_{args.variant_tag}"
 
     total_steps = args.phase_a_steps + args.phase_b_steps
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")

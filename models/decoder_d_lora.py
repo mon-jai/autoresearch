@@ -187,6 +187,24 @@ class LoRAQwenDecoder(QwenDecoderBase):
         self.model.save_pretrained(path)
 
     def load_adapters(self, path: str):
-        from peft import PeftModel
-        # Reinitialize model from base + adapters at `path`.
-        self.model = PeftModel.from_pretrained(self.model, path)
+        """Load adapter weights from disk into the existing LoRA model.
+
+        The __init__ already wrapped self.model in PeftModel. We just
+        need to load the adapter state_dict, NOT wrap a second time
+        (which would produce the nested-PeftModel "missing adapter keys"
+        warning).
+        """
+        import os, torch as _torch
+        adapter_path = os.path.join(path, "adapter_model.bin")
+        if not os.path.exists(adapter_path):
+            # Try safetensors format
+            adapter_path = os.path.join(path, "adapter_model.safetensors")
+        if os.path.exists(adapter_path) and adapter_path.endswith(".bin"):
+            state_dict = _torch.load(adapter_path, map_location="cpu")
+        else:
+            from safetensors.torch import load_file
+            state_dict = load_file(adapter_path)
+        # PEFT adapter keys in the saved file use the inner model's
+        # namespace. set_peft_model_state_dict handles the mapping.
+        from peft import set_peft_model_state_dict
+        set_peft_model_state_dict(self.model, state_dict)
