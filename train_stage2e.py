@@ -54,10 +54,15 @@ def parse_args():
                    help="Train on gold-only for this many steps before "
                         "mixing in synth. Ignored if --synth-jsonl is empty.")
     p.add_argument("--re-weight", type=float, default=1.0)
+    p.add_argument("--synth-weight", type=float, default=0.2,
+                   help="Weight on synth loss. total = gold + w*synth. "
+                        "Default 0.2 (gold-dominant).")
     p.add_argument("--eval-every", type=int, default=100)
     p.add_argument("--data-dir", default=None)
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--min-containment", type=float, default=1.0,
+                   help="Load-time filter on synth containment score.")
     p.add_argument("--save-best-to", default=None)
     return p.parse_args()
 
@@ -101,6 +106,7 @@ def main():
         synth_loader = build_synth_loader(
             tokenizer, args.synth_jsonl,
             batch_size=args.batch_size, max_length=args.max_length,
+            min_containment=args.min_containment,
         )
         print(f"  synth:     {len(synth_loader.dataset)} sentences")
 
@@ -139,10 +145,8 @@ def main():
                     model, synth_batch, device, re_weight=args.re_weight,
                 )
                 synth_loss_val = s_loss.item()
-                # Equal weight: gold + synth averaged
-                total = (gold_loss + s_loss) / 2
+                total = gold_loss + args.synth_weight * s_loss
             except Exception:
-                # Malformed synth batch (rare edge case with bad spans)
                 total = gold_loss
         else:
             total = gold_loss

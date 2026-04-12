@@ -40,7 +40,8 @@ class SynthDataset(Dataset):
     same format as SciERCSentenceDataset.__getitem__().
     """
     def __init__(self, jsonl_path, tokenizer, max_length: int = 128,
-                 entity_type: str = "Method"):
+                 entity_type: str = "Method",
+                 min_containment: float = 0.0):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.entity_type = entity_type
@@ -49,6 +50,8 @@ class SynthDataset(Dataset):
         with open(jsonl_path) as f:
             for line in f:
                 rec = json.loads(line)
+                if rec.get("containment", 1.0) < min_containment:
+                    continue
                 words = rec["synth_sentence"].strip().split()
                 if len(words) < 3:
                     continue
@@ -61,10 +64,16 @@ class SynthDataset(Dataset):
                     rel_id = REL2ID.get(rec["rel"], NO_REL_ID)
                 if rel_id == NO_REL_ID:
                     continue
+                # Use the source entity type from the jsonl if available;
+                # fall back to the constructor default (Fix 1 for stage2-010).
+                h_type = rec.get("entity_type", entity_type)
+                # Tail type isn't stored separately; use head type as proxy
+                # (SciERC triples often share the same type for both spans).
+                t_type = rec.get("tail_entity_type", h_type)
                 self.examples.append({
                     "words": words,
-                    "ner": [(head_span[0], head_span[1], entity_type),
-                            (tail_span[0], tail_span[1], entity_type)],
+                    "ner": [(head_span[0], head_span[1], h_type),
+                            (tail_span[0], tail_span[1], t_type)],
                     "relations": [(head_span, tail_span, rel_id)],
                 })
 
@@ -114,8 +123,10 @@ class SynthDataset(Dataset):
 
 
 def build_synth_loader(tokenizer, jsonl_path, batch_size: int = 16,
-                       max_length: int = 128, num_workers: int = 0):
-    ds = SynthDataset(jsonl_path, tokenizer, max_length)
+                       max_length: int = 128, num_workers: int = 0,
+                       min_containment: float = 0.0):
+    ds = SynthDataset(jsonl_path, tokenizer, max_length,
+                      min_containment=min_containment)
     pad_id = tokenizer.pad_token_id or 0
     loader = DataLoader(
         ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
