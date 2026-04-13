@@ -32,6 +32,7 @@ from models.bert_kg_encoder import BertKGExtractor
 DATASET_REGISTRY = {
     "scierc": "data.scierc",
     "conll04": "data.conll04",
+    "ade": "data.ade",
 }
 
 
@@ -208,6 +209,7 @@ def main():
         args.model_name = {
             "scierc": "allenai/scibert_scivocab_uncased",
             "conll04": "bert-base-uncased",
+            "ade": "allenai/scibert_scivocab_uncased",
         }.get(args.dataset, "bert-base-uncased")
 
     mode = f"{args.dataset} gold+synth" if use_synth else f"{args.dataset} gold-only"
