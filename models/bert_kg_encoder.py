@@ -114,27 +114,42 @@ class BertKGExtractor(nn.Module):
 
     def __init__(self, model_name: str = "bert-base-uncased", dropout: float = 0.1,
                  use_crf: bool = False,
-                 num_bio_tags: int = None, num_relations: int = None):
+                 num_bio_tags: int = None, num_relations: int = None,
+                 num_entity_types: int = None, use_span_ner: bool = False,
+                 max_span_width: int = 8):
         super().__init__()
         self.backbone = BertBackbone(model_name)
         hidden = self.backbone.hidden_size
 
         # Allow explicit override for multi-dataset support (train_multi.py).
-        # Falls back to data.scierc constants for backward compatibility.
         n_bio = num_bio_tags if num_bio_tags is not None else NUM_BIO_TAGS
         n_rel = num_relations if num_relations is not None else NUM_RELATIONS
 
         self.dropout = nn.Dropout(dropout)
         self.ner_head = nn.Linear(hidden, n_bio)
 
-        # Optional CRF layer for NER (stage2-012).
+        # Optional CRF layer for NER (stage2-012, negative result).
         self.use_crf = use_crf
         self.crf = None
         if use_crf:
             from torchcrf import CRF
             self.crf = CRF(n_bio, batch_first=True)
 
-        # Stage 2-004 RE head — naive 2H concat + 2-layer MLP.
+        # ── Span-based NER head (stage2-024) ──────────────────────────
+        # Classifies candidate (start, end) spans as entity_type or NONE.
+        # NONE = class 0; entity types = 1..num_entity_types.
+        # The BIO head is still used for backward compat; span head is
+        # an additional head that provides span-level predictions.
+        self.use_span_ner = use_span_ner
+        self.max_span_width = max_span_width
+        if use_span_ner:
+            n_ent = num_entity_types if num_entity_types is not None else 6  # SciERC default
+            # Span repr = [start; end; max_pool] → 3H input
+            self.span_ner_head = nn.Linear(hidden * 3, n_ent + 1)
+            self.span_width_emb = nn.Embedding(max_span_width, hidden)
+            self.span_width_proj = nn.Linear(hidden, hidden * 3)  # project width emb to 3H
+
+        # RE head — 2H concat + 2-layer MLP.
         self.re_head = nn.Sequential(
             nn.Linear(hidden * 2, hidden),
             nn.GELU(),
@@ -189,6 +204,73 @@ class BertKGExtractor(nn.Module):
 
     def forward_ner(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.ner_head(self.dropout(hidden_states))  # (B, T, NUM_BIO_TAGS)
+
+    def _first_token_for_word(self, word_ids_b: list, word_idx: int) -> int:
+        """Return the first token index mapped to word_idx."""
+        for i, wid in enumerate(word_ids_b):
+            if wid == word_idx:
+                return i
+        return 0
+
+    def _last_token_for_word(self, word_ids_b: list, word_idx: int) -> int:
+        """Return the last token index mapped to word_idx."""
+        last = 0
+        for i, wid in enumerate(word_ids_b):
+            if wid == word_idx:
+                last = i
+        return last
+
+    def span_repr_v2(self, hidden_states_b: torch.Tensor, word_ids_b: list,
+                     span: tuple) -> torch.Tensor:
+        """
+        SpERT-style span representation:
+          [start_token; end_token; max_pool(span_tokens)]
+        Returns (3H,)
+        """
+        word_start, word_end = span
+        start_tok = self._first_token_for_word(word_ids_b, word_start)
+        end_tok = self._last_token_for_word(word_ids_b, word_end)
+        start_vec = hidden_states_b[start_tok]
+        end_vec = hidden_states_b[end_tok]
+        pool_vec = self.span_repr(hidden_states_b, word_ids_b, span)
+        return torch.cat([start_vec, end_vec, pool_vec], dim=-1)  # (3H,)
+
+    def forward_span_ner(self, hidden_states_b: torch.Tensor, word_ids_b: list,
+                         num_words: int, max_span_width: int = 8):
+        """
+        Span-based NER v2: enumerate candidate spans, compute SpERT-style
+        span representations [start; end; max_pool], classify as entity
+        type or NONE.
+
+        Returns:
+            span_logits: (num_candidates, num_entity_types + 1)
+            candidates:  list of (start, end_inclusive) word-level spans
+        """
+        if not hasattr(self, "span_ner_head"):
+            raise RuntimeError("span_ner_head not initialized. Use use_span_ner=True.")
+        candidates = []
+        for s in range(num_words):
+            for e in range(s, min(s + max_span_width, num_words)):
+                candidates.append((s, e))
+        if not candidates:
+            return hidden_states_b.new_zeros((0, self.span_ner_head.out_features)), []
+
+        span_vecs = []
+        for (s, e) in candidates:
+            vec = self.span_repr_v2(hidden_states_b, word_ids_b, (s, e))
+            span_vecs.append(vec)
+        span_vecs = torch.stack(span_vecs, dim=0)  # (num_candidates, 3H)
+
+        # Add span width embedding (broadcast to 3H via linear projection)
+        widths = torch.tensor(
+            [min(e - s, self.span_width_emb.num_embeddings - 1) for (s, e) in candidates],
+            device=hidden_states_b.device, dtype=torch.long,
+        )
+        width_vec = self.span_width_proj(self.span_width_emb(widths))  # (N, 3H)
+        span_vecs = span_vecs + width_vec
+
+        logits = self.span_ner_head(self.dropout(span_vecs))
+        return logits, candidates
 
     def span_repr(self, hidden_states: torch.Tensor, word_ids_list: list, span: tuple) -> torch.Tensor:
         """
