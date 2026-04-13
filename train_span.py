@@ -54,6 +54,11 @@ def parse_args():
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save-best-to", default=None)
+    p.add_argument("--synth-jsonl", default="",
+                   help="Path to CAST pseudo-label jsonl. Empty = gold only.")
+    p.add_argument("--synth-weight", type=float, default=0.3)
+    p.add_argument("--gold-only-steps", type=int, default=500,
+                   help="Train on gold-only for this many steps before mixing synth.")
     return p.parse_args()
 
 
@@ -302,7 +307,18 @@ def main():
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps,
     )
 
+    use_synth = bool(args.synth_jsonl)
+    synth_loader = None
+    if use_synth:
+        from data.synth_loader import build_synth_loader
+        synth_loader = build_synth_loader(
+            tokenizer, args.synth_jsonl,
+            batch_size=args.batch_size, max_length=args.max_length,
+        )
+        print(f"  synth: {len(synth_loader.dataset)}")
+
     gold_iter = cycle(train_loader)
+    synth_iter = cycle(synth_loader) if synth_loader else None
     best_metrics = {"triple_f1": -1.0}
     best_step = -1
 
@@ -312,11 +328,28 @@ def main():
     while step < args.max_steps:
         optimizer.zero_grad()
         batch = next(gold_iter)
-        total, ner_loss, re_loss = compute_span_loss(
+        gold_loss, ner_loss, re_loss = compute_span_loss(
             model, batch, device, ds_mod, entity_type2id,
             re_weight=args.re_weight, neg_sample_ratio=args.neg_sample_ratio,
             max_span_width=args.max_span_width, focal_gamma=args.focal_gamma,
         )
+
+        synth_loss_val = 0.0
+        if use_synth and step >= args.gold_only_steps and synth_iter:
+            synth_batch = next(synth_iter)
+            try:
+                s_loss, _, _ = compute_span_loss(
+                    model, synth_batch, device, ds_mod, entity_type2id,
+                    re_weight=args.re_weight, neg_sample_ratio=args.neg_sample_ratio,
+                    max_span_width=args.max_span_width, focal_gamma=args.focal_gamma,
+                )
+                synth_loss_val = s_loss.item()
+                total = gold_loss + args.synth_weight * s_loss
+            except Exception:
+                total = gold_loss
+        else:
+            total = gold_loss
+
         total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -325,8 +358,8 @@ def main():
         if step % 10 == 0:
             dt = (time.time() - t0) * 1000 / max(step, 1)
             cur_lr = scheduler.get_last_lr()[0]
-            print(f"[Step {step:04d}] L={total.item():.4f} NER={ner_loss.item():.4f} "
-                  f"RE={re_loss.item():.4f} lr={cur_lr:.2e} | {dt:.0f}ms/step")
+            print(f"[Step {step:04d}] L={gold_loss.item():.4f} NER={ner_loss.item():.4f} "
+                  f"RE={re_loss.item():.4f} synth={synth_loss_val:.4f} lr={cur_lr:.2e} | {dt:.0f}ms/step")
 
         if step > 0 and step % args.eval_every == 0:
             metrics = evaluate_span(
