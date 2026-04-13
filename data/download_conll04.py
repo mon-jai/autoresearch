@@ -20,6 +20,9 @@ Splits:
     conll04_train.json
     conll04_dev.json
     conll04_test.json
+
+Source: SpERT data server (lavis.cs.hs-rm.de). The GitHub raw URLs
+return 404; the actual data is hosted separately.
 """
 import json
 import sys
@@ -29,7 +32,7 @@ from urllib.request import urlretrieve
 DATA_DIR = Path(__file__).parent / "conll04"
 
 # SpERT repo processed data (standard distribution)
-SPERT_BASE = "https://raw.githubusercontent.com/markus-eberts/spert/master/data/datasets/conll04"
+SPERT_BASE = "https://lavis.cs.hs-rm.de/storage/spert/public/datasets/conll04"
 SPLITS = {
     "conll04_train.json": f"{SPERT_BASE}/conll04_train.json",
     "conll04_dev.json":   f"{SPERT_BASE}/conll04_dev.json",
