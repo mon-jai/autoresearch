@@ -113,30 +113,33 @@ class BertKGExtractor(nn.Module):
     """
 
     def __init__(self, model_name: str = "bert-base-uncased", dropout: float = 0.1,
-                 use_crf: bool = False):
+                 use_crf: bool = False,
+                 num_bio_tags: int = None, num_relations: int = None):
         super().__init__()
         self.backbone = BertBackbone(model_name)
         hidden = self.backbone.hidden_size
 
-        self.dropout = nn.Dropout(dropout)
-        self.ner_head = nn.Linear(hidden, NUM_BIO_TAGS)
+        # Allow explicit override for multi-dataset support (train_multi.py).
+        # Falls back to data.scierc constants for backward compatibility.
+        n_bio = num_bio_tags if num_bio_tags is not None else NUM_BIO_TAGS
+        n_rel = num_relations if num_relations is not None else NUM_RELATIONS
 
-        # Optional CRF layer for NER (stage2-012). When enabled, NER loss
-        # uses CRF negative log-likelihood instead of per-token CE, and
-        # decoding uses Viterbi instead of greedy BIO-constrained argmax.
+        self.dropout = nn.Dropout(dropout)
+        self.ner_head = nn.Linear(hidden, n_bio)
+
+        # Optional CRF layer for NER (stage2-012).
         self.use_crf = use_crf
         self.crf = None
         if use_crf:
             from torchcrf import CRF
-            self.crf = CRF(NUM_BIO_TAGS, batch_first=True)
+            self.crf = CRF(n_bio, batch_first=True)
 
-        # Stage 2-004 RE head — naive 2H concat + 2-layer MLP. Refactored body
-        # but the same math as before; stage2-004 numbers must reproduce.
+        # Stage 2-004 RE head — naive 2H concat + 2-layer MLP.
         self.re_head = nn.Sequential(
             nn.Linear(hidden * 2, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, NUM_RELATIONS),
+            nn.Linear(hidden, n_rel),
         )
 
         # ── Pluggable adapters ─────────────────────────────────────────

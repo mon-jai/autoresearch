@@ -238,17 +238,20 @@ def main():
         )
         print(f"  synth: {len(synth_loader.dataset)}")
 
-    # Build model with dataset-specific head dimensions
-    # Monkey-patch the scierc constants temporarily so BertKGExtractor
-    # uses the right sizes. This is ugly but avoids rewriting the class.
+    # Build model with dataset-specific head dimensions via constructor args.
+    # Also patch data.scierc dicts in-place so that triple_f1's decode
+    # functions (which import ID2BIO at module level) use the right tags.
     import data.scierc as scierc_mod
-    orig_bio = scierc_mod.NUM_BIO_TAGS
-    orig_rel = scierc_mod.NUM_RELATIONS
-    scierc_mod.NUM_BIO_TAGS = ds_mod.NUM_BIO_TAGS
-    scierc_mod.NUM_RELATIONS = ds_mod.NUM_RELATIONS
-    model = BertKGExtractor(args.model_name).to(device)
-    scierc_mod.NUM_BIO_TAGS = orig_bio
-    scierc_mod.NUM_RELATIONS = orig_rel
+    scierc_mod.NO_REL_ID = ds_mod.NO_REL_ID
+    scierc_mod.ID2BIO.clear()
+    scierc_mod.ID2BIO.update(ds_mod.ID2BIO)
+    scierc_mod.BIO_TAG2ID.clear()
+    scierc_mod.BIO_TAG2ID.update(ds_mod.BIO_TAG2ID)
+    model = BertKGExtractor(
+        args.model_name,
+        num_bio_tags=ds_mod.NUM_BIO_TAGS,
+        num_relations=ds_mod.NUM_RELATIONS,
+    ).to(device)
 
     print(f"  NER head: {model.ner_head.out_features}  RE head: {model.re_head[-1].out_features}")
 
