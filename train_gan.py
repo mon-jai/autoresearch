@@ -56,6 +56,9 @@ def parse_args():
                    help="Critic updates per decoder update.")
     p.add_argument("--encoder-update-every", type=int, default=1,
                    help="Encoder updates every N steps.")
+    p.add_argument("--adv-stop-step", type=int, default=0,
+                   help="Stop critic+decoder updates after this step. 0 = never stop. "
+                        "Encoder continues training on gold only after this point.")
     # Reward
     p.add_argument("--alpha", type=float, default=1.0, help="Critic reward weight.")
     p.add_argument("--beta", type=float, default=1.0, help="Containment reward weight.")
@@ -193,54 +196,57 @@ def main():
         gold_batch = next(gold_iter)
         triples = sample_triples(gold_batch, ds_mod, args.synth_batch_size)
 
+        # Check if adversarial phase should stop
+        adv_active = (args.adv_stop_step == 0) or (step < args.adv_stop_step)
+
         # ══════════════════════════════════════════════════
         # Step A: Train Critic (n_critic times)
         # ══════════════════════════════════════════════════
         critic_loss_val = 0.0
         real_mean = 0.0
         fake_mean = 0.0
-        for _ in range(args.n_critic):
-            critic_optimizer.zero_grad()
 
-            # Real: arXiv text
-            real_batch = next(arxiv_iter)
-            with torch.no_grad():
-                real_hidden = encoder.encode(
-                    modality="text",
-                    input_ids=real_batch["input_ids"].to(device),
-                    attention_mask=real_batch["attention_mask"].to(device),
-                )
-            real_cls = real_hidden[:, 0, :].detach()
-            real_logits = critic(real_cls)
+        if adv_active:
+            for _ in range(args.n_critic):
+                critic_optimizer.zero_grad()
 
-            # Fake: Decoder output
-            if triples:
+                real_batch = next(arxiv_iter)
                 with torch.no_grad():
-                    fake_sentences = decoder.generate_batch(triples)
-                fake_enc = tokenizer(
-                    fake_sentences, return_tensors="pt", padding=True,
-                    truncation=True, max_length=args.max_length,
-                ).to(device)
-                with torch.no_grad():
-                    fake_hidden = encoder.encode(
+                    real_hidden = encoder.encode(
                         modality="text",
-                        input_ids=fake_enc["input_ids"],
-                        attention_mask=fake_enc["attention_mask"],
+                        input_ids=real_batch["input_ids"].to(device),
+                        attention_mask=real_batch["attention_mask"].to(device),
                     )
-                fake_cls = fake_hidden[:, 0, :].detach()
-                fake_logits = critic(fake_cls)
-                c_loss = critic_loss(real_logits, fake_logits)
-            else:
-                c_loss = F.binary_cross_entropy_with_logits(
-                    real_logits, torch.ones_like(real_logits),
-                )
+                real_cls = real_hidden[:, 0, :].detach()
+                real_logits = critic(real_cls)
 
-            c_loss.backward()
-            torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
-            critic_optimizer.step()
-            critic_loss_val = c_loss.item()
-            real_mean = real_logits.mean().item()
-            fake_mean = fake_logits.mean().item() if triples else 0.0
+                if triples:
+                    with torch.no_grad():
+                        fake_sentences = decoder.generate_batch(triples)
+                    fake_enc = tokenizer(
+                        fake_sentences, return_tensors="pt", padding=True,
+                        truncation=True, max_length=args.max_length,
+                    ).to(device)
+                    with torch.no_grad():
+                        fake_hidden = encoder.encode(
+                            modality="text",
+                            input_ids=fake_enc["input_ids"],
+                            attention_mask=fake_enc["attention_mask"],
+                        )
+                    fake_cls = fake_hidden[:, 0, :].detach()
+                    fake_logits = critic(fake_cls)
+                    c_loss = critic_loss(real_logits, fake_logits)
+                else:
+                    c_loss = F.binary_cross_entropy_with_logits(
+                        real_logits, torch.ones_like(real_logits),
+                    )
+
+                c_loss.backward()
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+                critic_optimizer.step()
+                critic_loss_val = c_loss.item()
+                real_mean = real_logits.mean().item()
+                fake_mean = fake_logits.mean().item() if triples else 0.0
 
         # ══════════════════════════════════════════════════
         # Step B: Train Decoder (REINFORCE with live critic)
@@ -250,7 +256,7 @@ def main():
         kl_val = 0.0
         containment_val = 0.0
 
-        if triples:
+        if adv_active and triples:
             lora_optimizer.zero_grad()
             sampled = decoder.sample_with_logprob(triples)
             synth_sentences = sampled["sentences"]
