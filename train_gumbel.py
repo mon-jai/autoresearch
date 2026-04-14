@@ -88,6 +88,9 @@ def parse_args():
                         "decoder gets exact gradients so n_critic=1 should suffice.")
     p.add_argument("--adv-stop-step", type=int, default=0,
                    help="Stop adversarial updates after this step. 0=never.")
+    p.add_argument("--feature-matching", action="store_true",
+                   help="Use feature matching loss instead of BCE for decoder update. "
+                        "Matches mean intermediate critic features between real and fake.")
     p.add_argument("--adv-start-step", type=int, default=200,
                    help="Start adversarial updates after this many supervised steps.")
     p.add_argument("--max-gen-tokens", type=int, default=40)
@@ -130,6 +133,48 @@ def sample_triples(batch, ds_mod, n):
 def cycle(loader):
     while True:
         yield from loader
+
+
+def gumbel_ste_cls(decoder, triples, encoder, projection,
+                   device, tau=1.0, max_gen_tokens=40):
+    """Like gumbel_ste_forward but returns CLS hidden state for feature matching."""
+    if not triples:
+        return None
+    with torch.no_grad():
+        sentences = decoder.generate_batch(triples, max_new_tokens=max_gen_tokens)
+    prompts = decoder.build_prompts(triples)
+    full_texts = [p + s for p, s in zip(prompts, sentences)]
+    full_enc = decoder.tokenizer(
+        full_texts, return_tensors="pt", padding=True,
+        truncation=True, max_length=256,
+    ).to(device)
+    prompt_enc = decoder.tokenizer(
+        prompts, return_tensors="pt", padding=True,
+        truncation=True, max_length=256,
+    ).to(device)
+    prompt_len = prompt_enc["input_ids"].shape[1]
+    outputs = decoder.model(
+        input_ids=full_enc["input_ids"],
+        attention_mask=full_enc["attention_mask"],
+    )
+    gen_logits = outputs.logits[:, prompt_len - 1:-1, :]
+    if gen_logits.shape[1] == 0:
+        return None
+    gen_logits_f32 = gen_logits.float()
+    fake_soft = F.gumbel_softmax(gen_logits_f32, tau=tau, hard=True, dim=-1)
+    qwen_wte = decoder.model.get_input_embeddings().weight
+    fake_embedded = fake_soft @ qwen_wte.float()
+    projected = projection(fake_embedded)
+    attn_mask = full_enc["attention_mask"][:, prompt_len:]
+    if attn_mask.shape[1] > projected.shape[1]:
+        attn_mask = attn_mask[:, :projected.shape[1]]
+    elif attn_mask.shape[1] < projected.shape[1]:
+        projected = projected[:, :attn_mask.shape[1], :]
+    hidden = encoder.backbone(
+        inputs_embeds=projected,
+        attention_mask=attn_mask,
+    )
+    return hidden[:, 0, :]  # (B, H_bert) — CLS
 
 
 def gumbel_ste_forward(decoder, triples, encoder, projection, critic,
@@ -243,6 +288,7 @@ def main():
     print(f"  n_critic:    {args.n_critic}")
     print(f"  adv_start:   {args.adv_start_step}")
     print(f"  adv_stop:    {args.adv_stop_step}")
+    print(f"  feat_match:  {args.feature_matching}")
     print(f"  LRs:         enc={args.encoder_lr} crit={args.critic_lr} "
           f"lora={args.lora_lr} proj={args.proj_lr}")
 
@@ -363,23 +409,27 @@ def main():
                 real_cls = real_hidden[:, 0, :].detach()
                 real_logits = critic_model(real_cls)
 
-                # Fake text via Gumbel-STE (no grad for critic step)
+                # Fake via Gumbel-STE path (same path as Step B)
+                # Critical: critic must see the same embedding path the
+                # decoder uses, otherwise the critic can't provide useful
+                # gradient signal. Prior v1/v2 used generate+tokenize here
+                # which is a different embedding space → decoder "won" trivially.
                 if triples:
                     with torch.no_grad():
-                        fake_sentences = decoder.generate_batch(triples)
-                    fake_enc = tokenizer(
-                        fake_sentences, return_tensors="pt", padding=True,
-                        truncation=True, max_length=args.max_length,
-                    ).to(device)
-                    with torch.no_grad():
-                        fake_hidden = encoder.encode(
-                            modality="text",
-                            input_ids=fake_enc["input_ids"],
-                            attention_mask=fake_enc["attention_mask"],
+                        fake_cls_for_critic = gumbel_ste_cls(
+                            decoder, triples, encoder, projection,
+                            device, tau=current_tau,
+                            max_gen_tokens=args.max_gen_tokens,
                         )
-                    fake_cls = fake_hidden[:, 0, :].detach()
-                    fake_logits = critic_model(fake_cls)
-                    c_loss = critic_loss(real_logits, fake_logits)
+                    if fake_cls_for_critic is not None:
+                        fake_cls = fake_cls_for_critic.detach()
+                        fake_logits = critic_model(fake_cls)
+                        c_loss = critic_loss(real_logits, fake_logits)
+                    else:
+                        c_loss = F.binary_cross_entropy_with_logits(
+                            real_logits, torch.ones_like(real_logits),
+                        )
+                        fake_logits = real_logits  # placeholder
                 else:
                     c_loss = F.binary_cross_entropy_with_logits(
                         real_logits, torch.ones_like(real_logits),
@@ -406,17 +456,25 @@ def main():
             encoder.requires_grad_(False)
             critic_model.requires_grad_(False)
 
-            fake_critic_logits, n_fake = gumbel_ste_forward(
-                decoder, triples, encoder, projection, critic_model,
+            # Single Gumbel-STE path for CLS (gradient flows to decoder LoRA)
+            fake_cls_b = gumbel_ste_cls(
+                decoder, triples, encoder, projection,
                 device, tau=current_tau, max_gen_tokens=args.max_gen_tokens,
             )
 
-            if fake_critic_logits is not None and n_fake > 0:
-                # Decoder wants critic to think fake is real (target=1)
-                loss_d = F.binary_cross_entropy_with_logits(
-                    fake_critic_logits,
-                    torch.ones_like(fake_critic_logits),
-                )
+            if fake_cls_b is not None:
+                if args.feature_matching:
+                    # Feature matching: match mean intermediate critic features
+                    fake_feat = critic_model.features(fake_cls_b)
+                    real_feat = critic_model.features(real_cls.detach())
+                    loss_d = F.mse_loss(fake_feat.mean(0), real_feat.mean(0))
+                else:
+                    # Standard: decoder wants critic to think fake is real
+                    fake_logits_b = critic_model(fake_cls_b)
+                    loss_d = F.binary_cross_entropy_with_logits(
+                        fake_logits_b,
+                        torch.ones_like(fake_logits_b),
+                    )
                 loss_d.backward()
                 torch.nn.utils.clip_grad_norm_(lora_params, 1.0)
                 torch.nn.utils.clip_grad_norm_(projection.parameters(), 1.0)

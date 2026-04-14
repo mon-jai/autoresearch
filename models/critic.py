@@ -24,19 +24,24 @@ import torch.nn.functional as F
 class RealismCritic(nn.Module):
     def __init__(self, hidden_size: int, dropout: float = 0.1):
         super().__init__()
-        self.head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, 1),  # logit for P(real)
-        )
+        self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_size, 1)  # logit for P(real)
 
     def forward(self, cls_hidden: torch.Tensor) -> torch.Tensor:
         """
         cls_hidden: (B, H)  — the [CLS] vector from a BERT pass
         Returns:    (B,)    — raw logits; > 0 means "predict real"
         """
-        return self.head(cls_hidden).squeeze(-1)
+        feat = self.act(self.fc1(cls_hidden))
+        feat = self.drop(feat)
+        return self.fc2(feat).squeeze(-1)
+
+    def features(self, cls_hidden: torch.Tensor) -> torch.Tensor:
+        """Return intermediate features (after GELU, before dropout/fc2).
+        Used for feature matching loss in Gumbel-STE training."""
+        return self.act(self.fc1(cls_hidden))
 
 
 def critic_loss(real_logits: torch.Tensor, fake_logits: torch.Tensor) -> torch.Tensor:
