@@ -21,9 +21,13 @@ Usage:
 """
 import argparse
 import importlib
+import os
 import random
 import time
 from pathlib import Path
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 import torch.nn as nn
@@ -288,10 +292,10 @@ def main():
     )
 
     # -- Vocab projection (Qwen hidden -> SciBERT hidden) --
-    from transformers import AutoConfig
-    qwen_config = AutoConfig.from_pretrained(args.decoder_name)
-    projection = VocabProjection(qwen_config.hidden_size, hidden_size).to(device)
-    print(f"  projection:  {qwen_config.hidden_size} -> {hidden_size}")
+    # Get Qwen hidden size from the already-loaded model (no extra HF call)
+    qwen_hidden = decoder.model.config.hidden_size
+    projection = VocabProjection(qwen_hidden, hidden_size).to(device)
+    print(f"  projection:  {qwen_hidden} -> {hidden_size}")
 
     # -- Optimizers --
     encoder_optimizer = AdamW(encoder.parameters(), lr=args.encoder_lr, weight_decay=0.01)
