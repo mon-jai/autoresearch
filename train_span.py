@@ -59,6 +59,23 @@ def parse_args():
     p.add_argument("--synth-weight", type=float, default=0.3)
     p.add_argument("--gold-only-steps", type=int, default=500,
                    help="Train on gold-only for this many steps before mixing synth.")
+    p.add_argument("--pretrain-ckpt", default="",
+                   help="Path to ELECTRA cooperative pre-training checkpoint. "
+                        "Loads discriminator backbone weights, reinitializes task heads.")
+    p.add_argument("--cl-weight", type=float, default=0.0,
+                   help="Weight for supervised contrastive (InfoNCE) loss on span embeddings. "
+                        "0 = disabled (default). Recommended: 0.05-0.2.")
+    p.add_argument("--cl-tau", type=float, default=0.1,
+                   help="Temperature for contrastive loss. Lower = sharper.")
+    p.add_argument("--cl-entity-only", action="store_true",
+                   help="Only use entity spans (not NONE) for contrastive loss.")
+    p.add_argument("--bio-weight", type=float, default=0.0,
+                   help="Weight for auxiliary BIO NER loss (multi-task). "
+                        "0 = disabled. STSN (2024) shows BIO labels improve span reps.")
+    p.add_argument("--rdrop-weight", type=float, default=0.0,
+                   help="Weight for R-Drop KL-divergence consistency loss. "
+                        "0 = disabled. Passes batch twice with different dropout, "
+                        "adds KL(p1||p2) + KL(p2||p1) on span NER logits.")
     return p.parse_args()
 
 
@@ -67,6 +84,62 @@ def focal_loss(logits, targets, gamma=2.0):
     ce = F.cross_entropy(logits, targets, reduction="none")
     pt = torch.exp(-ce)
     return ((1 - pt) ** gamma * ce).mean()
+
+
+def supervised_contrastive_loss(span_vecs, labels, tau=0.1, entity_only=False):
+    """
+    Supervised InfoNCE contrastive loss on span representations.
+
+    Args:
+        span_vecs: (N, D) L2-normalized span vectors
+        labels: (N,) entity type ids (0=NONE, 1+=entity types)
+        tau: temperature
+        entity_only: if True, only use entity spans (label > 0)
+
+    Returns:
+        scalar loss
+    """
+    if entity_only:
+        mask = labels > 0
+        if mask.sum() < 2:
+            return span_vecs.new_tensor(0.0)
+        span_vecs = span_vecs[mask]
+        labels = labels[mask]
+
+    N = span_vecs.size(0)
+    if N < 2:
+        return span_vecs.new_tensor(0.0)
+
+    # Similarity matrix
+    sim = torch.mm(span_vecs, span_vecs.t()) / tau  # (N, N)
+
+    # Positive mask: same label, exclude self
+    pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)).float()
+    pos_mask.fill_diagonal_(0)
+
+    # Need at least one positive pair
+    if pos_mask.sum() == 0:
+        return span_vecs.new_tensor(0.0)
+
+    # Log-sum-exp over all non-self entries (denominator)
+    self_mask = torch.eye(N, device=span_vecs.device).bool()
+    sim_masked = sim.masked_fill(self_mask, float('-inf'))
+    log_denom = torch.logsumexp(sim_masked, dim=1)  # (N,)
+
+    # For each anchor, average log-prob over its positive pairs
+    # loss_i = -1/|P(i)| * sum_{p in P(i)} (sim(i,p)/tau - log_denom(i))
+    n_pos_per_anchor = pos_mask.sum(dim=1)  # (N,)
+    has_pos = n_pos_per_anchor > 0
+
+    if not has_pos.any():
+        return span_vecs.new_tensor(0.0)
+
+    log_prob = sim - log_denom.unsqueeze(1)  # (N, N)
+    # Mask to only positive pairs, sum, average per anchor
+    pos_log_prob = (log_prob * pos_mask).sum(dim=1)  # (N,)
+    loss_per_anchor = -pos_log_prob[has_pos] / n_pos_per_anchor[has_pos]
+
+    return loss_per_anchor.mean()
 
 
 def _build_span_labels(gold_entities, num_words, max_span_width, entity_type2id):
@@ -85,8 +158,9 @@ def _build_span_labels(gold_entities, num_words, max_span_width, entity_type2id)
 
 def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                       re_weight=1.0, neg_sample_ratio=0.5, max_span_width=8,
-                      focal_gamma=2.0):
-    """Compute span NER loss + RE loss."""
+                      focal_gamma=2.0, cl_weight=0.0, cl_tau=0.1,
+                      cl_entity_only=False, bio_weight=0.0):
+    """Compute span NER loss + RE loss + optional BIO auxiliary loss."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
     word_ids_list = batch["word_ids"]
@@ -96,19 +170,40 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
 
     hidden = model.encode(modality="text", input_ids=input_ids, attention_mask=attention_mask)
 
+    # Auxiliary BIO NER loss (multi-task, per STSN 2024)
+    bio_loss = hidden.new_tensor(0.0)
+    if bio_weight > 0:
+        ner_labels = batch["ner_labels"].to(device)
+        bio_logits = model.forward_ner(hidden)  # (B, T, NUM_BIO_TAGS)
+        bio_loss = F.cross_entropy(
+            bio_logits.view(-1, bio_logits.size(-1)),
+            ner_labels.view(-1),
+            ignore_index=-100,
+        )
+
     span_losses = []
     re_losses = []
     NO_REL = ds_mod.NO_REL_ID
+    use_cl = cl_weight > 0
+    # Accumulate span vecs/labels across batch for batch-level contrastive
+    batch_cl_vecs = []
+    batch_cl_labels = []
 
     for b_idx in range(input_ids.size(0)):
         n_words = num_words_list[b_idx]
         gold_ents = gold_entities_list[b_idx]
         gold_rels = gold_relations_list[b_idx]
 
-        # Span NER
-        span_logits, candidates = model.forward_span_ner(
-            hidden[b_idx], word_ids_list[b_idx], n_words, max_span_width,
-        )
+        # Span NER (optionally return span vectors for contrastive loss)
+        if use_cl:
+            span_logits, candidates, span_vecs = model.forward_span_ner(
+                hidden[b_idx], word_ids_list[b_idx], n_words, max_span_width,
+                return_span_vecs=True,
+            )
+        else:
+            span_logits, candidates = model.forward_span_ner(
+                hidden[b_idx], word_ids_list[b_idx], n_words, max_span_width,
+            )
         if not candidates:
             continue
 
@@ -119,6 +214,12 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
         for (s, e) in candidates:
             targets.append(gold_labels.get((s, e), 0))
         targets = torch.tensor(targets, device=device, dtype=torch.long)
+
+        # Collect span vectors for batch-level contrastive loss
+        if use_cl and span_vecs is not None:
+            cl_vecs = F.normalize(span_vecs, p=2, dim=-1)
+            batch_cl_vecs.append(cl_vecs)
+            batch_cl_labels.append(targets)
 
         # Negative sampling: keep all positives + sample negatives
         pos_mask = targets > 0
@@ -148,8 +249,17 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
 
     ner_loss = torch.stack(span_losses).mean() if span_losses else hidden.new_tensor(0.0)
     re_loss = torch.stack(re_losses).mean() if re_losses else hidden.new_tensor(0.0)
-    total = ner_loss + re_weight * re_loss
-    return total, ner_loss.detach(), re_loss.detach()
+    # Batch-level contrastive: concatenate all span vecs across batch, then one CL call
+    if use_cl and batch_cl_vecs:
+        all_vecs = torch.cat(batch_cl_vecs, dim=0)
+        all_labels = torch.cat(batch_cl_labels, dim=0)
+        contrastive_loss = supervised_contrastive_loss(
+            all_vecs, all_labels, tau=cl_tau, entity_only=cl_entity_only,
+        )
+    else:
+        contrastive_loss = hidden.new_tensor(0.0)
+    total = ner_loss + re_weight * re_loss + cl_weight * contrastive_loss + bio_weight * bio_loss
+    return total, ner_loss.detach(), re_loss.detach(), contrastive_loss.detach(), bio_loss.detach()
 
 
 def evaluate_span(model, dataloader, device, ds_mod, entity_type2id, id2entity_type,
@@ -299,6 +409,24 @@ def main():
         use_span_ner=True,
         max_span_width=args.max_span_width,
     ).to(device)
+
+    # Load ELECTRA cooperative pre-training checkpoint if provided
+    if args.pretrain_ckpt:
+        ckpt = torch.load(args.pretrain_ckpt, map_location=device)
+        pretrained_sd = ckpt["discriminator"]
+        # Load backbone + adapter weights, skip task heads with strict=False
+        missing, unexpected = model.load_state_dict(pretrained_sd, strict=False)
+        # Reinitialize task-specific heads for fresh fine-tuning
+        model.span_ner_head.reset_parameters()
+        model.span_width_emb.reset_parameters()
+        model.span_width_proj.reset_parameters()
+        for m in model.re_head:
+            if hasattr(m, "reset_parameters"):
+                m.reset_parameters()
+        print(f"  Loaded pre-trained weights from {args.pretrain_ckpt}")
+        print(f"    step={ckpt.get('step')}, mlm_acc={ckpt.get('mlm_acc', '?'):.4f}, rtd_acc={ckpt.get('rtd_acc', '?'):.4f}")
+        print(f"    missing keys: {len(missing)}, unexpected: {len(unexpected)}")
+
     print(f"  span_ner_head:  {model.span_ner_head}")
     print(f"  re_head out:    {model.re_head[-1].out_features}")
 
@@ -322,26 +450,38 @@ def main():
     best_metrics = {"triple_f1": -1.0}
     best_step = -1
 
+    use_cl = args.cl_weight > 0
+    if use_cl:
+        print(f"  contrastive:    weight={args.cl_weight} tau={args.cl_tau} entity_only={args.cl_entity_only}")
+    if args.bio_weight > 0:
+        print(f"  bio_multitask:  weight={args.bio_weight}")
+
     model.train()
     t0 = time.time()
     step = 0
     while step < args.max_steps:
         optimizer.zero_grad()
         batch = next(gold_iter)
-        gold_loss, ner_loss, re_loss = compute_span_loss(
+        gold_loss, ner_loss, re_loss, cl_loss, bio_l = compute_span_loss(
             model, batch, device, ds_mod, entity_type2id,
             re_weight=args.re_weight, neg_sample_ratio=args.neg_sample_ratio,
             max_span_width=args.max_span_width, focal_gamma=args.focal_gamma,
+            cl_weight=args.cl_weight, cl_tau=args.cl_tau,
+            cl_entity_only=args.cl_entity_only,
+            bio_weight=args.bio_weight,
         )
 
         synth_loss_val = 0.0
         if use_synth and step >= args.gold_only_steps and synth_iter:
             synth_batch = next(synth_iter)
             try:
-                s_loss, _, _ = compute_span_loss(
+                s_loss, _, _, _, _ = compute_span_loss(
                     model, synth_batch, device, ds_mod, entity_type2id,
                     re_weight=args.re_weight, neg_sample_ratio=args.neg_sample_ratio,
                     max_span_width=args.max_span_width, focal_gamma=args.focal_gamma,
+                    cl_weight=args.cl_weight, cl_tau=args.cl_tau,
+                    cl_entity_only=args.cl_entity_only,
+                    bio_weight=args.bio_weight,
                 )
                 synth_loss_val = s_loss.item()
                 total = gold_loss + args.synth_weight * s_loss
@@ -358,8 +498,10 @@ def main():
         if step % 10 == 0:
             dt = (time.time() - t0) * 1000 / max(step, 1)
             cur_lr = scheduler.get_last_lr()[0]
+            cl_str = f" CL={cl_loss.item():.4f}" if use_cl else ""
+            bio_str = f" BIO={bio_l.item():.4f}" if args.bio_weight > 0 else ""
             print(f"[Step {step:04d}] L={gold_loss.item():.4f} NER={ner_loss.item():.4f} "
-                  f"RE={re_loss.item():.4f} synth={synth_loss_val:.4f} lr={cur_lr:.2e} | {dt:.0f}ms/step")
+                  f"RE={re_loss.item():.4f}{cl_str}{bio_str} synth={synth_loss_val:.4f} lr={cur_lr:.2e} | {dt:.0f}ms/step")
 
         if step > 0 and step % args.eval_every == 0:
             metrics = evaluate_span(
