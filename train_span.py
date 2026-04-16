@@ -77,6 +77,9 @@ def parse_args():
                         "linearly decay to --bio-end. Overrides --bio-weight.")
     p.add_argument("--bio-end", type=float, default=0.0,
                    help="End bio_weight for curriculum decay (used with --bio-start).")
+    p.add_argument("--bio-enrich", default="none", choices=["none", "logits", "probs"],
+                   help="STSN-style: concat averaged BIO features per span into span repr. "
+                        "'logits' = raw BIO logits, 'probs' = softmax probabilities.")
     p.add_argument("--rdrop-weight", type=float, default=0.0,
                    help="Weight for R-Drop KL-divergence consistency loss. "
                         "0 = disabled. Passes batch twice with different dropout, "
@@ -177,9 +180,11 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
     hidden = model.encode(modality="text", input_ids=input_ids, attention_mask=attention_mask)
 
     # Auxiliary BIO NER loss (multi-task, per STSN 2024)
+    # Also compute BIO logits when bio_enrich needs them for span repr
     bio_loss = hidden.new_tensor(0.0)
     bio_logits = None
-    if bio_weight > 0 or return_bio_logits:
+    need_bio = bio_weight > 0 or return_bio_logits or model.bio_enrich != "none"
+    if need_bio:
         ner_labels = batch["ner_labels"].to(device)
         bio_logits = model.forward_ner(hidden)  # (B, T, NUM_BIO_TAGS)
         if bio_weight > 0:
@@ -202,15 +207,19 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
         gold_ents = gold_entities_list[b_idx]
         gold_rels = gold_relations_list[b_idx]
 
+        # BIO logits for this example (for bio_enrich)
+        bio_logits_b = bio_logits[b_idx].detach() if bio_logits is not None else None
+
         # Span NER (optionally return span vectors for contrastive loss)
         if use_cl:
             span_logits, candidates, span_vecs = model.forward_span_ner(
                 hidden[b_idx], word_ids_list[b_idx], n_words, max_span_width,
-                return_span_vecs=True,
+                return_span_vecs=True, bio_logits_b=bio_logits_b,
             )
         else:
             span_logits, candidates = model.forward_span_ner(
                 hidden[b_idx], word_ids_list[b_idx], n_words, max_span_width,
+                bio_logits_b=bio_logits_b,
             )
         if not candidates:
             continue
@@ -418,6 +427,7 @@ def main():
         num_entity_types=num_entity_types,
         use_span_ner=True,
         max_span_width=args.max_span_width,
+        bio_enrich=args.bio_enrich,
     ).to(device)
 
     # Load ELECTRA cooperative pre-training checkpoint if provided
@@ -470,6 +480,8 @@ def main():
         print(f"  bio_curriculum: {args.bio_start} → {args.bio_end} over {args.max_steps} steps")
     elif args.bio_weight > 0:
         print(f"  bio_multitask:  weight={args.bio_weight}")
+    if args.bio_enrich != "none":
+        print(f"  bio_enrich:     {args.bio_enrich}")
     if args.rdrop_weight > 0:
         print(f"  rdrop:          weight={args.rdrop_weight}")
 

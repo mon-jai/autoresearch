@@ -116,7 +116,7 @@ class BertKGExtractor(nn.Module):
                  use_crf: bool = False,
                  num_bio_tags: int = None, num_relations: int = None,
                  num_entity_types: int = None, use_span_ner: bool = False,
-                 max_span_width: int = 8):
+                 max_span_width: int = 8, bio_enrich: str = "none"):
         super().__init__()
         self.backbone = BertBackbone(model_name)
         hidden = self.backbone.hidden_size
@@ -142,10 +142,12 @@ class BertKGExtractor(nn.Module):
         # an additional head that provides span-level predictions.
         self.use_span_ner = use_span_ner
         self.max_span_width = max_span_width
+        self.bio_enrich = bio_enrich  # "none", "logits", or "probs"
         if use_span_ner:
             n_ent = num_entity_types if num_entity_types is not None else 6  # SciERC default
-            # Span repr = [start; end; max_pool] → 3H input
-            self.span_ner_head = nn.Linear(hidden * 3, n_ent + 1)
+            # Span repr = [start; end; max_pool] → 3H input (+ n_bio if bio_enrich)
+            span_in_dim = hidden * 3 + (n_bio if bio_enrich != "none" else 0)
+            self.span_ner_head = nn.Linear(span_in_dim, n_ent + 1)
             self.span_width_emb = nn.Embedding(max_span_width, hidden)
             self.span_width_proj = nn.Linear(hidden, hidden * 3)  # project width emb to 3H
 
@@ -236,15 +238,23 @@ class BertKGExtractor(nn.Module):
         return torch.cat([start_vec, end_vec, pool_vec], dim=-1)  # (3H,)
 
     def forward_span_ner(self, hidden_states_b: torch.Tensor, word_ids_b: list,
-                         num_words: int, max_span_width: int = 8):
+                         num_words: int, max_span_width: int = 8,
+                         return_span_vecs: bool = False,
+                         bio_logits_b: torch.Tensor = None):
         """
         Span-based NER v2: enumerate candidate spans, compute SpERT-style
         span representations [start; end; max_pool], classify as entity
         type or NONE.
 
+        Args:
+            bio_logits_b: (T, NUM_BIO_TAGS) optional BIO logits for this example.
+                Used when bio_enrich != "none" to concatenate averaged BIO features
+                per span into the span vector (STSN-inspired enrichment).
+
         Returns:
             span_logits: (num_candidates, num_entity_types + 1)
             candidates:  list of (start, end_inclusive) word-level spans
+            span_vecs:   (num_candidates, D) if return_span_vecs=True, else None
         """
         if not hasattr(self, "span_ner_head"):
             raise RuntimeError("span_ner_head not initialized. Use use_span_ner=True.")
@@ -253,7 +263,8 @@ class BertKGExtractor(nn.Module):
             for e in range(s, min(s + max_span_width, num_words)):
                 candidates.append((s, e))
         if not candidates:
-            return hidden_states_b.new_zeros((0, self.span_ner_head.out_features)), []
+            empty = hidden_states_b.new_zeros((0, self.span_ner_head.out_features))
+            return (empty, [], None) if return_span_vecs else (empty, [])
 
         span_vecs = []
         for (s, e) in candidates:
@@ -269,7 +280,28 @@ class BertKGExtractor(nn.Module):
         width_vec = self.span_width_proj(self.span_width_emb(widths))  # (N, 3H)
         span_vecs = span_vecs + width_vec
 
+        # STSN-inspired: concatenate BIO features per span
+        if self.bio_enrich != "none" and bio_logits_b is not None:
+            bio_feats = []
+            for (s, e) in candidates:
+                # Average BIO logits/probs over tokens in this span
+                token_idx = [
+                    i for i, wid in enumerate(word_ids_b)
+                    if wid is not None and s <= wid <= e
+                ]
+                if token_idx:
+                    span_bio = bio_logits_b[token_idx].mean(dim=0)  # (NUM_BIO_TAGS,)
+                else:
+                    span_bio = bio_logits_b.new_zeros(bio_logits_b.size(-1))
+                if self.bio_enrich == "probs":
+                    span_bio = F.softmax(span_bio, dim=-1)
+                bio_feats.append(span_bio)
+            bio_feats = torch.stack(bio_feats, dim=0)  # (N, NUM_BIO_TAGS)
+            span_vecs = torch.cat([span_vecs, bio_feats], dim=-1)  # (N, 3H + NUM_BIO_TAGS)
+
         logits = self.span_ner_head(self.dropout(span_vecs))
+        if return_span_vecs:
+            return logits, candidates, span_vecs
         return logits, candidates
 
     def span_repr(self, hidden_states: torch.Tensor, word_ids_list: list, span: tuple) -> torch.Tensor:
