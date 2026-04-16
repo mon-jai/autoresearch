@@ -72,6 +72,11 @@ def parse_args():
     p.add_argument("--bio-weight", type=float, default=0.0,
                    help="Weight for auxiliary BIO NER loss (multi-task). "
                         "0 = disabled. STSN (2024) shows BIO labels improve span reps.")
+    p.add_argument("--bio-start", type=float, default=0.0,
+                   help="If >0, use curriculum: start bio_weight at this value and "
+                        "linearly decay to --bio-end. Overrides --bio-weight.")
+    p.add_argument("--bio-end", type=float, default=0.0,
+                   help="End bio_weight for curriculum decay (used with --bio-start).")
     p.add_argument("--rdrop-weight", type=float, default=0.0,
                    help="Weight for R-Drop KL-divergence consistency loss. "
                         "0 = disabled. Passes batch twice with different dropout, "
@@ -453,7 +458,12 @@ def main():
     use_cl = args.cl_weight > 0
     if use_cl:
         print(f"  contrastive:    weight={args.cl_weight} tau={args.cl_tau} entity_only={args.cl_entity_only}")
-    if args.bio_weight > 0:
+
+    # Bio-weight curriculum: if --bio-start > 0, linearly decay from bio_start to bio_end
+    use_bio_curriculum = args.bio_start > 0
+    if use_bio_curriculum:
+        print(f"  bio_curriculum: {args.bio_start} → {args.bio_end} over {args.max_steps} steps")
+    elif args.bio_weight > 0:
         print(f"  bio_multitask:  weight={args.bio_weight}")
 
     model.train()
@@ -462,13 +472,20 @@ def main():
     while step < args.max_steps:
         optimizer.zero_grad()
         batch = next(gold_iter)
+
+        # Compute effective bio_weight (curriculum or constant)
+        if use_bio_curriculum:
+            bio_w_eff = args.bio_start - (args.bio_start - args.bio_end) * (step / max(args.max_steps - 1, 1))
+        else:
+            bio_w_eff = args.bio_weight
+
         gold_loss, ner_loss, re_loss, cl_loss, bio_l = compute_span_loss(
             model, batch, device, ds_mod, entity_type2id,
             re_weight=args.re_weight, neg_sample_ratio=args.neg_sample_ratio,
             max_span_width=args.max_span_width, focal_gamma=args.focal_gamma,
             cl_weight=args.cl_weight, cl_tau=args.cl_tau,
             cl_entity_only=args.cl_entity_only,
-            bio_weight=args.bio_weight,
+            bio_weight=bio_w_eff,
         )
 
         synth_loss_val = 0.0
@@ -481,7 +498,7 @@ def main():
                     max_span_width=args.max_span_width, focal_gamma=args.focal_gamma,
                     cl_weight=args.cl_weight, cl_tau=args.cl_tau,
                     cl_entity_only=args.cl_entity_only,
-                    bio_weight=args.bio_weight,
+                    bio_weight=bio_w_eff,
                 )
                 synth_loss_val = s_loss.item()
                 total = gold_loss + args.synth_weight * s_loss
@@ -499,7 +516,7 @@ def main():
             dt = (time.time() - t0) * 1000 / max(step, 1)
             cur_lr = scheduler.get_last_lr()[0]
             cl_str = f" CL={cl_loss.item():.4f}" if use_cl else ""
-            bio_str = f" BIO={bio_l.item():.4f}" if args.bio_weight > 0 else ""
+            bio_str = f" BIO={bio_l.item():.4f}(w={bio_w_eff:.3f})" if bio_w_eff > 0 else ""
             print(f"[Step {step:04d}] L={gold_loss.item():.4f} NER={ner_loss.item():.4f} "
                   f"RE={re_loss.item():.4f}{cl_str}{bio_str} synth={synth_loss_val:.4f} lr={cur_lr:.2e} | {dt:.0f}ms/step")
 
