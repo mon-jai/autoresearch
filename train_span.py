@@ -302,15 +302,22 @@ def evaluate_span(model, dataloader, device, ds_mod, entity_type2id, id2entity_t
 
         hidden = model.encode(modality="text", input_ids=input_ids, attention_mask=attention_mask)
 
+        # Compute BIO logits for bio_enrich (STSN-style span enrichment)
+        bio_logits = None
+        if model.bio_enrich != "none":
+            bio_logits = model.forward_ner(hidden)  # (B, T, NUM_BIO_TAGS)
+
         for b_idx in range(input_ids.size(0)):
             n_examples += 1
             n_words = num_words_list[b_idx]
             gold_ents = gold_entities_list[b_idx]
             gold_rels = gold_relations_list[b_idx]
+            bio_logits_b = bio_logits[b_idx] if bio_logits is not None else None
 
             with torch.no_grad():
                 span_logits, candidates = model.forward_span_ner(
                     hidden[b_idx], word_ids_list[b_idx], n_words, max_span_width,
+                    bio_logits_b=bio_logits_b,
                 )
 
             if not candidates:
