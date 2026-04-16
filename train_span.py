@@ -164,7 +164,8 @@ def _build_span_labels(gold_entities, num_words, max_span_width, entity_type2id)
 def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                       re_weight=1.0, neg_sample_ratio=0.5, max_span_width=8,
                       focal_gamma=2.0, cl_weight=0.0, cl_tau=0.1,
-                      cl_entity_only=False, bio_weight=0.0):
+                      cl_entity_only=False, bio_weight=0.0,
+                      return_bio_logits=False):
     """Compute span NER loss + RE loss + optional BIO auxiliary loss."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -177,14 +178,16 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
 
     # Auxiliary BIO NER loss (multi-task, per STSN 2024)
     bio_loss = hidden.new_tensor(0.0)
-    if bio_weight > 0:
+    bio_logits = None
+    if bio_weight > 0 or return_bio_logits:
         ner_labels = batch["ner_labels"].to(device)
         bio_logits = model.forward_ner(hidden)  # (B, T, NUM_BIO_TAGS)
-        bio_loss = F.cross_entropy(
-            bio_logits.view(-1, bio_logits.size(-1)),
-            ner_labels.view(-1),
-            ignore_index=-100,
-        )
+        if bio_weight > 0:
+            bio_loss = F.cross_entropy(
+                bio_logits.view(-1, bio_logits.size(-1)),
+                ner_labels.view(-1),
+                ignore_index=-100,
+            )
 
     span_losses = []
     re_losses = []
@@ -264,6 +267,8 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
     else:
         contrastive_loss = hidden.new_tensor(0.0)
     total = ner_loss + re_weight * re_loss + cl_weight * contrastive_loss + bio_weight * bio_loss
+    if return_bio_logits:
+        return total, ner_loss.detach(), re_loss.detach(), contrastive_loss.detach(), bio_loss.detach(), bio_logits
     return total, ner_loss.detach(), re_loss.detach(), contrastive_loss.detach(), bio_loss.detach()
 
 
@@ -465,6 +470,8 @@ def main():
         print(f"  bio_curriculum: {args.bio_start} → {args.bio_end} over {args.max_steps} steps")
     elif args.bio_weight > 0:
         print(f"  bio_multitask:  weight={args.bio_weight}")
+    if args.rdrop_weight > 0:
+        print(f"  rdrop:          weight={args.rdrop_weight}")
 
     model.train()
     t0 = time.time()
@@ -479,14 +486,44 @@ def main():
         else:
             bio_w_eff = args.bio_weight
 
-        gold_loss, ner_loss, re_loss, cl_loss, bio_l = compute_span_loss(
-            model, batch, device, ds_mod, entity_type2id,
-            re_weight=args.re_weight, neg_sample_ratio=args.neg_sample_ratio,
-            max_span_width=args.max_span_width, focal_gamma=args.focal_gamma,
-            cl_weight=args.cl_weight, cl_tau=args.cl_tau,
-            cl_entity_only=args.cl_entity_only,
-            bio_weight=bio_w_eff,
-        )
+        use_rdrop = args.rdrop_weight > 0
+        if use_rdrop:
+            # R-Drop: two forward passes with different dropout, KL on BIO logits
+            gold_loss, ner_loss, re_loss, cl_loss, bio_l, bio_logits1 = compute_span_loss(
+                model, batch, device, ds_mod, entity_type2id,
+                re_weight=args.re_weight, neg_sample_ratio=args.neg_sample_ratio,
+                max_span_width=args.max_span_width, focal_gamma=args.focal_gamma,
+                cl_weight=args.cl_weight, cl_tau=args.cl_tau,
+                cl_entity_only=args.cl_entity_only,
+                bio_weight=bio_w_eff, return_bio_logits=True,
+            )
+            gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
+                model, batch, device, ds_mod, entity_type2id,
+                re_weight=args.re_weight, neg_sample_ratio=args.neg_sample_ratio,
+                max_span_width=args.max_span_width, focal_gamma=args.focal_gamma,
+                cl_weight=args.cl_weight, cl_tau=args.cl_tau,
+                cl_entity_only=args.cl_entity_only,
+                bio_weight=bio_w_eff, return_bio_logits=True,
+            )
+            # Average the two losses + symmetric KL on BIO logits
+            gold_loss = (gold_loss + gold_loss2) / 2
+            if bio_logits1 is not None and bio_logits2 is not None:
+                p = F.log_softmax(bio_logits1.view(-1, bio_logits1.size(-1)), dim=-1)
+                q = F.log_softmax(bio_logits2.view(-1, bio_logits2.size(-1)), dim=-1)
+                rdrop_loss = (F.kl_div(p, q.exp(), reduction='batchmean') +
+                              F.kl_div(q, p.exp(), reduction='batchmean')) / 2
+            else:
+                rdrop_loss = gold_loss.new_tensor(0.0)
+            gold_loss = gold_loss + args.rdrop_weight * rdrop_loss
+        else:
+            gold_loss, ner_loss, re_loss, cl_loss, bio_l = compute_span_loss(
+                model, batch, device, ds_mod, entity_type2id,
+                re_weight=args.re_weight, neg_sample_ratio=args.neg_sample_ratio,
+                max_span_width=args.max_span_width, focal_gamma=args.focal_gamma,
+                cl_weight=args.cl_weight, cl_tau=args.cl_tau,
+                cl_entity_only=args.cl_entity_only,
+                bio_weight=bio_w_eff,
+            )
 
         synth_loss_val = 0.0
         if use_synth and step >= args.gold_only_steps and synth_iter:
@@ -517,8 +554,9 @@ def main():
             cur_lr = scheduler.get_last_lr()[0]
             cl_str = f" CL={cl_loss.item():.4f}" if use_cl else ""
             bio_str = f" BIO={bio_l.item():.4f}(w={bio_w_eff:.3f})" if bio_w_eff > 0 else ""
+            rdrop_str = f" RD={rdrop_loss.item():.4f}" if use_rdrop else ""
             print(f"[Step {step:04d}] L={gold_loss.item():.4f} NER={ner_loss.item():.4f} "
-                  f"RE={re_loss.item():.4f}{cl_str}{bio_str} synth={synth_loss_val:.4f} lr={cur_lr:.2e} | {dt:.0f}ms/step")
+                  f"RE={re_loss.item():.4f}{cl_str}{bio_str}{rdrop_str} synth={synth_loss_val:.4f} lr={cur_lr:.2e} | {dt:.0f}ms/step")
 
         if step > 0 and step % args.eval_every == 0:
             metrics = evaluate_span(
