@@ -55,8 +55,13 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save-best-to", default=None)
     p.add_argument("--synth-jsonl", default="",
-                   help="Path to CAST pseudo-label jsonl. Empty = gold only.")
+                   help="Path to synth/cycle JSONL. Empty = gold only. "
+                        "Used for both CAST pseudo-labels and CycleGT round-trip data.")
+    p.add_argument("--cycle-jsonl", default="", dest="cycle_jsonl_alias",
+                   help="Alias for --synth-jsonl (CycleGT round-trip data).")
     p.add_argument("--synth-weight", type=float, default=0.3)
+    p.add_argument("--cycle-weight", type=float, default=None,
+                   help="Alias for --synth-weight (cycle consistency weight).")
     p.add_argument("--gold-only-steps", type=int, default=500,
                    help="Train on gold-only for this many steps before mixing synth.")
     p.add_argument("--pretrain-ckpt", default="",
@@ -84,7 +89,13 @@ def parse_args():
                    help="Weight for R-Drop KL-divergence consistency loss. "
                         "0 = disabled. Passes batch twice with different dropout, "
                         "adds KL(p1||p2) + KL(p2||p1) on span NER logits.")
-    return p.parse_args()
+    args = p.parse_args()
+    # Resolve cycle aliases
+    if args.cycle_jsonl_alias and not args.synth_jsonl:
+        args.synth_jsonl = args.cycle_jsonl_alias
+    if args.cycle_weight is not None:
+        args.synth_weight = args.cycle_weight
+    return args
 
 
 def focal_loss(logits, targets, gamma=2.0):
