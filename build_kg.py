@@ -109,19 +109,25 @@ def pluralize_match(a, b):
     return False
 
 
-def build_entity_clusters(entities, sim_threshold=0.8):
+def build_entity_clusters(entities, sim_threshold=0.8, use_embeddings=False,
+                          embedding_model=None, embedding_threshold=0.85):
     """
-    Cluster entity mentions by string similarity.
+    Cluster entity mentions by string similarity + optional embedding similarity.
     Returns: dict mapping each mention → canonical form (most frequent).
+
+    Two-pass approach:
+      Pass 1: exact normalized form match (always)
+      Pass 2: string Jaccard + substring + pluralize (guarded)
+      Pass 3 (optional): embedding cosine similarity for remaining singletons
     """
     normalized = {e: normalize_entity(e) for e in entities}
 
-    # Group by normalized form (exact match after normalization)
+    # Pass 1: Group by normalized form (exact match after normalization)
     norm_groups = defaultdict(list)
     for original, norm in normalized.items():
         norm_groups[norm].append(original)
 
-    # Merge groups with high string similarity or substring match
+    # Pass 2: Merge groups with high string similarity or substring match
     group_list = list(norm_groups.items())
     merged = [False] * len(group_list)
     clusters = []
@@ -145,6 +151,43 @@ def build_entity_clusters(entities, sim_threshold=0.8):
 
         clusters.append(cluster)
 
+    # Pass 3: Embedding-based merging for remaining singletons
+    if use_embeddings and embedding_model is not None:
+        singleton_indices = [i for i, c in enumerate(clusters) if len(c) == 1]
+        if len(singleton_indices) >= 2:
+            singleton_texts = [normalize_entity(clusters[i][0]) for i in singleton_indices]
+
+            # Encode all singletons
+            import torch
+            with torch.no_grad():
+                encodings = embedding_model(
+                    singleton_texts, padding=True, truncation=True,
+                    max_length=32, return_tensors="pt",
+                )
+                # Use [CLS] embedding
+                embeddings = encodings.last_hidden_state[:, 0, :]
+                embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=-1)
+                sim_matrix = torch.mm(embeddings, embeddings.t())
+
+            # Greedy merge high-similarity singletons
+            emb_merged = [False] * len(singleton_indices)
+            for i in range(len(singleton_indices)):
+                if emb_merged[i]:
+                    continue
+                for j in range(i + 1, len(singleton_indices)):
+                    if emb_merged[j]:
+                        continue
+                    if sim_matrix[i, j].item() >= embedding_threshold:
+                        # Merge j into i's cluster
+                        ci = singleton_indices[i]
+                        cj = singleton_indices[j]
+                        clusters[ci].extend(clusters[cj])
+                        clusters[cj] = []  # mark empty
+                        emb_merged[j] = True
+
+            # Remove empty clusters
+            clusters = [c for c in clusters if c]
+
     # Pick canonical: longest mention in the largest cluster (more informative)
     mention_to_canonical = {}
     for cluster in clusters:
@@ -162,10 +205,10 @@ def filter_triple(triple, filter_mode, conf_threshold):
     elif filter_mode == "confidence":
         return triple["triple_conf"] >= conf_threshold
     elif filter_mode == "llm":
-        return triple.get("llm_verdict") == "yes"
+        return triple.get("llm_verdict") in ("yes", "keep")
     elif filter_mode == "verified":
         return (triple["triple_conf"] >= conf_threshold
-                and triple.get("llm_verdict") == "yes")
+                and triple.get("llm_verdict") in ("yes", "keep"))
     return True
 
 

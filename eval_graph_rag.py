@@ -29,6 +29,9 @@ def parse_args():
     p.add_argument("--ollama-url", default="http://localhost:11434")
     p.add_argument("--ollama-model", default="qwen3:32b")
     p.add_argument("--max-questions", type=int, default=100)
+    p.add_argument("--use-gold-kg", action="store_true",
+                   help="Build KG from gold triples instead of using --kg. "
+                        "Tests RAG pipeline ceiling without encoder errors.")
     p.add_argument("--output", default="results/graph_rag_eval.json")
     return p.parse_args()
 
@@ -172,15 +175,40 @@ def check_answer(predicted, gold):
     return overlap >= 0.5
 
 
+def build_gold_kg(records):
+    """Build KG directly from gold triples (ceiling test)."""
+    edges = []
+    nodes = {}
+    for rec in records:
+        for t in rec.get("gold_triples", []):
+            h = t["head_text"].lower().strip()
+            tl = t["tail_text"].lower().strip()
+            rel = t["relation"]
+            if not h or not tl or rel == "CONJUNCTION":
+                continue
+            edge = {"head": h, "relation": rel, "tail": tl, "confidence": 1.0, "n_sources": 1}
+            edges.append(edge)
+            for e in [h, tl]:
+                if e not in nodes:
+                    nodes[e] = {"id": e, "frequency": 0}
+                nodes[e]["frequency"] += 1
+    return {"nodes": list(nodes.values()), "edges": edges}
+
+
 def main():
     args = parse_args()
 
-    with open(args.kg) as f:
-        kg = json.load(f)
     with open(args.gold_jsonl) as f:
         records = [json.loads(line) for line in f]
 
-    print(f"=== Graph RAG Evaluation (On-Premise) ===")
+    if args.use_gold_kg:
+        kg = build_gold_kg(records)
+        print(f"=== Graph RAG Evaluation — GOLD KG CEILING TEST ===")
+    else:
+        with open(args.kg) as f:
+            kg = json.load(f)
+        print(f"=== Graph RAG Evaluation (On-Premise) ===")
+
     print(f"  KG: {len(kg['nodes'])} nodes, {len(kg['edges'])} edges")
     print(f"  Model: {args.ollama_model}")
 

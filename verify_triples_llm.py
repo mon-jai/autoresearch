@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 
-VERIFY_PROMPT = """You are a scientific knowledge graph expert. Given a sentence from a scientific paper and a predicted relation triple, determine if the triple is correct.
+VERIFY_PROMPT_SIMPLE = """You are a scientific knowledge graph expert. Given a sentence from a scientific paper and a predicted relation triple, determine if the triple is correct.
 
 Sentence: "{sentence}"
 
@@ -37,6 +37,26 @@ Is this triple correctly extracted from the sentence? Consider:
 
 Answer with ONLY one word: Yes, No, or Uncertain."""
 
+VERIFY_PROMPT_CORRECT = """You are a scientific knowledge graph expert. Given a sentence and a predicted relation triple, choose one action:
+
+Sentence: "{sentence}"
+
+Predicted triple: ({head}, {relation}, {tail})
+
+Available relations: USED-FOR, FEATURE-OF, HYPONYM-OF, EVALUATE-FOR, PART-OF, COMPARE, CONJUNCTION
+
+Choose ONE action:
+- KEEP: The triple is correct as-is.
+- CORRECT: The triple has an error. Provide the corrected triple.
+- DISCARD: The triple is wrong and cannot be fixed.
+
+Answer in this exact format (one line only):
+KEEP
+or
+CORRECT: (corrected_head, corrected_relation, corrected_tail)
+or
+DISCARD"""
+
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -47,6 +67,8 @@ def parse_args():
     p.add_argument("--min-triple-conf", type=float, default=0.0,
                    help="Only verify triples with confidence >= this threshold. "
                         "Saves LLM calls on obviously bad triples.")
+    p.add_argument("--mode", default="correct", choices=["simple", "correct"],
+                   help="simple: Yes/No/Uncertain. correct: Keep/Correct/Discard.")
     p.add_argument("--max-docs", type=int, default=0, help="0 = all")
     return p.parse_args()
 
@@ -58,7 +80,7 @@ def call_ollama(ollama_url, model, prompt):
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "think": False,
-        "options": {"temperature": 0.0, "num_predict": 10},
+        "options": {"temperature": 0.0, "num_predict": 80},
     })
     try:
         result = subprocess.run(
@@ -73,16 +95,41 @@ def call_ollama(ollama_url, model, prompt):
         return "Error"
 
 
-def parse_verdict(response):
+def parse_verdict_simple(response):
     """Parse LLM response to Yes/No/Uncertain."""
     r = response.lower().strip().rstrip(".").strip()
     if r.startswith("yes"):
-        return "yes"
+        return {"action": "keep"}
     elif r.startswith("no"):
-        return "no"
+        return {"action": "discard"}
     elif r.startswith("uncertain"):
-        return "uncertain"
-    return "unknown"
+        return {"action": "uncertain"}
+    return {"action": "unknown"}
+
+
+def parse_verdict_correct(response):
+    """Parse Keep/Correct/Discard response with optional correction."""
+    r = response.strip()
+    first_line = r.split("\n")[0].strip()
+
+    if first_line.upper().startswith("KEEP"):
+        return {"action": "keep"}
+    elif first_line.upper().startswith("DISCARD"):
+        return {"action": "discard"}
+    elif first_line.upper().startswith("CORRECT"):
+        # Try to parse: CORRECT: (head, relation, tail)
+        rest = first_line[len("CORRECT"):].strip().lstrip(":").strip()
+        rest = rest.strip("()").strip()
+        parts = [p.strip().strip("'\"") for p in rest.split(",")]
+        if len(parts) == 3:
+            return {
+                "action": "correct",
+                "corrected_head": parts[0],
+                "corrected_relation": parts[1].upper().replace(" ", "-"),
+                "corrected_tail": parts[2],
+            }
+        return {"action": "correct_failed", "raw": rest}
+    return {"action": "unknown"}
 
 
 def main():
@@ -98,8 +145,13 @@ def main():
         1 for r in records for t in r["predicted_triples"]
         if t["triple_conf"] >= args.min_triple_conf
     )
+    use_correct = args.mode == "correct"
+    prompt_template = VERIFY_PROMPT_CORRECT if use_correct else VERIFY_PROMPT_SIMPLE
+    parse_fn = parse_verdict_correct if use_correct else parse_verdict_simple
+
     print(f"=== LLM Triple Verification (On-Premise) ===")
     print(f"  Model: {args.ollama_model} via {args.ollama_url}")
+    print(f"  Mode: {args.mode}")
     print(f"  Input: {args.input} ({len(records)} docs, {total_triples} triples)")
     print(f"  Min confidence: {args.min_triple_conf} → {eligible} triples to verify")
 
@@ -107,7 +159,8 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     n_verified = 0
-    n_yes = n_no = n_uncertain = n_skip = 0
+    counts = {"keep": 0, "discard": 0, "correct": 0, "correct_failed": 0,
+              "uncertain": 0, "unknown": 0, "skip": 0}
     t0 = time.time()
 
     with open(out_path, "w") as fout:
@@ -118,28 +171,29 @@ def main():
                 if triple["triple_conf"] < args.min_triple_conf:
                     triple["llm_verdict"] = "skipped"
                     verified_triples.append(triple)
-                    n_skip += 1
+                    counts["skip"] += 1
                     continue
 
-                prompt = VERIFY_PROMPT.format(
+                prompt = prompt_template.format(
                     sentence=rec["sentence"],
                     head=triple["head_text"],
                     relation=triple["relation"],
                     tail=triple["tail_text"],
                 )
                 response = call_ollama(args.ollama_url, args.ollama_model, prompt)
-                verdict = parse_verdict(response)
+                verdict = parse_fn(response)
 
-                triple["llm_verdict"] = verdict
+                triple["llm_verdict"] = verdict["action"]
                 triple["llm_raw"] = response
-                verified_triples.append(triple)
 
-                if verdict == "yes":
-                    n_yes += 1
-                elif verdict == "no":
-                    n_no += 1
-                else:
-                    n_uncertain += 1
+                # Apply correction if available
+                if verdict["action"] == "correct" and "corrected_head" in verdict:
+                    triple["corrected_head"] = verdict["corrected_head"]
+                    triple["corrected_relation"] = verdict["corrected_relation"]
+                    triple["corrected_tail"] = verdict["corrected_tail"]
+
+                verified_triples.append(triple)
+                counts[verdict["action"]] = counts.get(verdict["action"], 0) + 1
                 n_verified += 1
 
             rec["predicted_triples"] = verified_triples
@@ -148,41 +202,63 @@ def main():
             if (rec["doc_id"] + 1) % 50 == 0:
                 elapsed = time.time() - t0
                 print(f"  [{rec['doc_id']+1}/{len(records)}] "
-                      f"verified={n_verified} yes={n_yes} no={n_no} unc={n_uncertain} "
+                      f"verified={n_verified} keep={counts['keep']} "
+                      f"correct={counts['correct']} discard={counts['discard']} "
                       f"({elapsed:.0f}s)")
 
     elapsed = time.time() - t0
     print(f"\n=== Verification Complete ===")
-    print(f"  Verified: {n_verified}, Skipped: {n_skip}")
-    print(f"  Yes: {n_yes} ({n_yes/max(n_verified,1):.1%})")
-    print(f"  No: {n_no} ({n_no/max(n_verified,1):.1%})")
-    print(f"  Uncertain: {n_uncertain} ({n_uncertain/max(n_verified,1):.1%})")
+    print(f"  Verified: {n_verified}, Skipped: {counts['skip']}")
+    for action in ["keep", "correct", "discard", "correct_failed", "uncertain", "unknown"]:
+        if counts[action] > 0:
+            print(f"  {action:15s}: {counts[action]} ({counts[action]/max(n_verified,1):.1%})")
     print(f"  Time: {elapsed:.0f}s ({elapsed/max(n_verified,1):.1f}s/triple)")
     print(f"  Output: {out_path}")
 
-    # Evaluate: compare LLM-filtered vs raw vs gold
+    # Evaluate: compare different filters vs gold
     with open(out_path) as f:
         verified_records = [json.loads(line) for line in f]
 
     has_gold = any(r["gold_triples"] for r in verified_records)
     if has_gold:
+        def make_triple_set(triples, filter_fn, use_corrections=False):
+            result = set()
+            for t in triples:
+                if not filter_fn(t):
+                    continue
+                if use_corrections and t.get("llm_verdict") == "correct" and "corrected_head" in t:
+                    # Use corrected triple — match against gold by text
+                    h = t["corrected_head"].lower().strip()
+                    tl = t["corrected_tail"].lower().strip()
+                    rel = t["corrected_relation"]
+                else:
+                    h = t.get("head_text", "").lower().strip()
+                    tl = t.get("tail_text", "").lower().strip()
+                    rel = t["relation"]
+                result.add((h, tl, rel))
+            return result
+
+        def make_gold_set(triples):
+            return {
+                (t["head_text"].lower().strip(), t["tail_text"].lower().strip(), t["relation"])
+                for t in triples
+            }
+
         print(f"\n  Quality comparison (with gold labels):")
-        for label, filter_fn in [
-            ("All predicted", lambda t: True),
-            ("Confidence >= 0.5", lambda t: t["triple_conf"] >= 0.5),
-            ("LLM = Yes", lambda t: t.get("llm_verdict") == "yes"),
-            ("Conf >= 0.5 + LLM = Yes", lambda t: t["triple_conf"] >= 0.5 and t.get("llm_verdict") == "yes"),
-        ]:
+        filters = [
+            ("All predicted", lambda t: True, False),
+            ("Confidence >= 0.5", lambda t: t["triple_conf"] >= 0.5, False),
+            ("LLM keep", lambda t: t.get("llm_verdict") == "keep", False),
+            ("LLM keep+correct (orig)", lambda t: t.get("llm_verdict") in ("keep", "correct"), False),
+            ("LLM keep+correct (fixed)", lambda t: t.get("llm_verdict") in ("keep", "correct"), True),
+            ("Conf>=0.5 + keep", lambda t: t["triple_conf"] >= 0.5 and t.get("llm_verdict") == "keep", False),
+            ("Conf>=0.5 + keep+corr", lambda t: t["triple_conf"] >= 0.5 and t.get("llm_verdict") in ("keep", "correct"), True),
+        ]
+        for label, filter_fn, use_corr in filters:
             tp = fp = fn = 0
             for rec in verified_records:
-                pred_set = {
-                    (tuple(t["head"]), tuple(t["tail"]), t["relation"])
-                    for t in rec["predicted_triples"] if filter_fn(t)
-                }
-                gold_set = {
-                    (tuple(t["head"]), tuple(t["tail"]), t["relation"])
-                    for t in rec["gold_triples"]
-                }
+                pred_set = make_triple_set(rec["predicted_triples"], filter_fn, use_corr)
+                gold_set = make_gold_set(rec["gold_triples"])
                 tp += len(pred_set & gold_set)
                 fp += len(pred_set - gold_set)
                 fn += len(gold_set - pred_set)
