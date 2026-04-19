@@ -38,8 +38,10 @@ from models.bert_kg_encoder import BertKGExtractor
 
 DATASET_REGISTRY = {
     "scierc": "data.scierc",
+    "scier": "data.scier",
     "conll04": "data.conll04",
     "ade": "data.ade",
+    "accord": "data.code_accord",
 }
 
 
@@ -65,8 +67,10 @@ def main():
     if args.model_name is None:
         args.model_name = {
             "scierc": "allenai/scibert_scivocab_uncased",
+            "scier": "allenai/scibert_scivocab_uncased",
             "conll04": "bert-base-uncased",
             "ade": "allenai/scibert_scivocab_uncased",
+            "accord": "allenai/scibert_scivocab_uncased",
         }.get(args.dataset, "bert-base-uncased")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
