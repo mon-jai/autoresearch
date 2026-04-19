@@ -29,14 +29,17 @@ from models.bert_kg_encoder import BertKGExtractor
 
 DATASET_REGISTRY = {
     "scierc": "data.scierc",
+    "scier": "data.scier",
     "conll04": "data.conll04",
     "ade": "data.ade",
+    "accord": "data.code_accord",
 }
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", default="scierc", choices=list(DATASET_REGISTRY.keys()))
+    p.add_argument("--dataset", default="scierc",
+                   choices=list(DATASET_REGISTRY.keys()))
     p.add_argument("--model-name", default=None)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--max-length", type=int, default=128)
@@ -264,11 +267,22 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
             span_loss = focal_loss(span_logits[keep_indices], targets[keep_indices], gamma=focal_gamma)
             span_losses.append(span_loss)
 
-        # RE loss — same as train_multi.py but using gold entity spans
-        if len(gold_ents) >= 2:
+        # RE loss — use union of gold + predicted entity spans so the RE head
+        # is trained on the same noisy-entity distribution it sees at eval time.
+        # Gold spans ensure positive pairs are always available; predicted FP
+        # spans add NO_REL pairs that calibrate the head for eval.
+        gold_span_set = {(s, e) for (s, e, _) in gold_ents}
+        with torch.no_grad():
+            pred_types_re = span_logits.argmax(dim=-1).tolist()
+            pred_confs_re = torch.softmax(span_logits, dim=-1).max(dim=-1).values.tolist()
+        pred_span_set = set()
+        for (s, e), etype_id, conf in zip(candidates, pred_types_re, pred_confs_re):
+            if etype_id > 0 and conf >= 0.5:
+                pred_span_set.add((s, e))
+        re_spans = list(pred_span_set | gold_span_set)
+        if len(re_spans) >= 2:
             rel_lookup = {(h, t): rid for (h, t, rid) in gold_rels}
-            spans = [(s, e) for (s, e, _) in gold_ents]
-            pairs = [(h, t) for h in spans for t in spans if h != t]
+            pairs = [(h, t) for h in re_spans for t in re_spans if h != t]
             if pairs:
                 pair_targets = [rel_lookup.get((h, t), NO_REL) for (h, t) in pairs]
                 pair_targets_t = torch.tensor(pair_targets, device=device, dtype=torch.long)
@@ -293,7 +307,7 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
 
 
 def evaluate_span(model, dataloader, device, ds_mod, entity_type2id, id2entity_type,
-                  max_span_width=8, span_threshold=0.5):
+                  max_span_width=8, span_threshold=0.5, verbose=False):
     """Evaluate with span-based NER predictions feeding into RE."""
     from eval.triple_f1 import _prf
     model.eval()
@@ -302,92 +316,118 @@ def evaluate_span(model, dataloader, device, ds_mod, entity_type2id, id2entity_t
     ner_tp = ner_fp = ner_fn = 0
     triple_tp = triple_fp = triple_fn = 0
     n_examples = 0
+    # Diagnostic counters
+    total_pred_ents = 0
+    total_gold_ents = 0
+    total_pred_rels = 0
+    total_gold_rels = 0
+    total_re_pairs = 0
 
-    for batch in dataloader:
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        word_ids_list = batch["word_ids"]
-        gold_entities_list = batch["gold_entities"]
-        gold_relations_list = batch["gold_relations"]
-        num_words_list = batch["num_words"]
+    with torch.no_grad():
+        for batch in dataloader:
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            word_ids_list = batch["word_ids"]
+            gold_entities_list = batch["gold_entities"]
+            gold_relations_list = batch["gold_relations"]
+            num_words_list = batch["num_words"]
 
-        hidden = model.encode(modality="text", input_ids=input_ids, attention_mask=attention_mask)
+            hidden = model.encode(modality="text", input_ids=input_ids, attention_mask=attention_mask)
 
-        # Compute BIO logits for bio_enrich (STSN-style span enrichment)
-        bio_logits = None
-        if model.bio_enrich != "none":
-            bio_logits = model.forward_ner(hidden)  # (B, T, NUM_BIO_TAGS)
+            # Compute BIO logits for bio_enrich (STSN-style span enrichment)
+            bio_logits = None
+            if model.bio_enrich != "none":
+                bio_logits = model.forward_ner(hidden)  # (B, T, NUM_BIO_TAGS)
 
-        for b_idx in range(input_ids.size(0)):
-            n_examples += 1
-            n_words = num_words_list[b_idx]
-            gold_ents = gold_entities_list[b_idx]
-            gold_rels = gold_relations_list[b_idx]
-            bio_logits_b = bio_logits[b_idx] if bio_logits is not None else None
+            for b_idx in range(input_ids.size(0)):
+                n_examples += 1
+                n_words = num_words_list[b_idx]
+                gold_ents = gold_entities_list[b_idx]
+                gold_rels = gold_relations_list[b_idx]
+                bio_logits_b = bio_logits[b_idx] if bio_logits is not None else None
 
-            with torch.no_grad():
                 span_logits, candidates = model.forward_span_ner(
                     hidden[b_idx], word_ids_list[b_idx], n_words, max_span_width,
                     bio_logits_b=bio_logits_b,
                 )
 
-            if not candidates:
-                ner_fn += len(gold_ents)
-                continue
+                total_gold_ents += len(gold_ents)
+                gold_full = {(h, t, r) for (h, t, r) in gold_rels}
+                total_gold_rels += len(gold_full)
 
-            # Predict spans: take argmax, keep those != NONE (0)
-            span_probs = torch.softmax(span_logits, dim=-1)
-            pred_types = span_logits.argmax(dim=-1).tolist()
-            pred_confs = span_probs.max(dim=-1).values.tolist()
+                if not candidates:
+                    ner_fn += len(gold_ents)
+                    triple_fn += len(gold_full)
+                    continue
 
-            pred_spans = []
-            for (s, e), etype_id, conf in zip(candidates, pred_types, pred_confs):
-                if etype_id > 0 and conf >= span_threshold:
-                    etype = id2entity_type.get(etype_id, "Unknown")
-                    pred_spans.append((s, e, etype))
+                # Predict spans: take argmax, keep those != NONE (0)
+                span_probs = torch.softmax(span_logits, dim=-1)
+                pred_types = span_logits.argmax(dim=-1).tolist()
+                pred_confs = span_probs.max(dim=-1).values.tolist()
 
-            # Remove overlapping spans: keep highest confidence
-            # (greedy non-overlapping: sort by confidence, skip overlaps)
-            scored = sorted(
-                [(s, e, t, pred_confs[candidates.index((s, e))]) for (s, e, t) in pred_spans],
-                key=lambda x: -x[3],
-            )
-            taken = set()
-            filtered = []
-            for (s, e, t, c) in scored:
-                overlap = any(
-                    not (e < ts or te < s)
-                    for (ts, te) in taken
+                pred_spans = []
+                for (s, e), etype_id, conf in zip(candidates, pred_types, pred_confs):
+                    if etype_id > 0 and conf >= span_threshold:
+                        etype = id2entity_type.get(etype_id, "Unknown")
+                        pred_spans.append((s, e, etype))
+
+                # Remove overlapping spans: keep highest confidence
+                # (greedy non-overlapping: sort by confidence, skip overlaps)
+                scored = sorted(
+                    [(s, e, t, pred_confs[candidates.index((s, e))]) for (s, e, t) in pred_spans],
+                    key=lambda x: -x[3],
                 )
-                if not overlap:
-                    filtered.append((s, e, t))
-                    taken.add((s, e))
-            pred_spans = filtered
+                taken = set()
+                filtered = []
+                for (s, e, t, c) in scored:
+                    overlap = any(
+                        not (e < ts or te < s)
+                        for (ts, te) in taken
+                    )
+                    if not overlap:
+                        filtered.append((s, e, t))
+                        taken.add((s, e))
+                pred_spans = filtered
+                total_pred_ents += len(pred_spans)
 
-            # NER F1
-            pred_ent_set = {(s, e, t) for (s, e, t) in pred_spans}
-            gold_ent_set = {(s, e, t) for (s, e, t) in gold_ents}
-            ner_tp += len(pred_ent_set & gold_ent_set)
-            ner_fp += len(pred_ent_set - gold_ent_set)
-            ner_fn += len(gold_ent_set - pred_ent_set)
+                # NER F1
+                pred_ent_set = {(s, e, t) for (s, e, t) in pred_spans}
+                gold_ent_set = {(s, e, t) for (s, e, t) in gold_ents}
+                ner_tp += len(pred_ent_set & gold_ent_set)
+                ner_fp += len(pred_ent_set - gold_ent_set)
+                ner_fn += len(gold_ent_set - pred_ent_set)
 
-            # Triple F1 (full pipeline)
-            pred_span_list = [(s, e) for (s, e, _) in pred_spans]
-            pred_pairs = [(a, b) for a in pred_span_list for b in pred_span_list if a != b]
-            if pred_pairs:
-                with torch.no_grad():
+                # Triple F1 (full pipeline)
+                pred_span_list = [(s, e) for (s, e, _) in pred_spans]
+                pred_pairs = [(a, b) for a in pred_span_list for b in pred_span_list if a != b]
+                total_re_pairs += len(pred_pairs)
+                if pred_pairs:
                     pred_re_logits = model.forward_re(hidden[b_idx], word_ids_list[b_idx], pred_pairs)
-                pred_re_ids = pred_re_logits.argmax(dim=-1).tolist()
-                pred_full = {(h, t, p) for (h, t), p in zip(pred_pairs, pred_re_ids) if p != NO_REL}
-            else:
-                pred_full = set()
-            gold_full = {(h, t, r) for (h, t, r) in gold_rels}
-            triple_tp += len(pred_full & gold_full)
-            triple_fp += len(pred_full - gold_full)
-            triple_fn += len(gold_full - pred_full)
+                    pred_re_ids = pred_re_logits.argmax(dim=-1).tolist()
+                    pred_full = {(h, t, p) for (h, t), p in zip(pred_pairs, pred_re_ids) if p != NO_REL}
+                else:
+                    pred_full = set()
+                total_pred_rels += len(pred_full)
+                triple_tp += len(pred_full & gold_full)
+                triple_fp += len(pred_full - gold_full)
+                triple_fn += len(gold_full - pred_full)
 
     _, _, nf = _prf(ner_tp, ner_fp, ner_fn)
     _, _, tf = _prf(triple_tp, triple_fp, triple_fn)
+
+    if verbose:
+        ner_p = ner_tp / max(ner_tp + ner_fp, 1)
+        ner_r = ner_tp / max(ner_tp + ner_fn, 1)
+        tri_p = triple_tp / max(triple_tp + triple_fp, 1)
+        tri_r = triple_tp / max(triple_tp + triple_fn, 1)
+        no_rel_frac = 1.0 - total_pred_rels / max(total_re_pairs, 1)
+        print(f"    [diag] pred_ents={total_pred_ents} gold_ents={total_gold_ents} | "
+              f"pred_rels={total_pred_rels} gold_rels={total_gold_rels} | "
+              f"re_pairs={total_re_pairs} NO_REL%={no_rel_frac:.2f}")
+        print(f"    [diag] NER  P={ner_p:.3f} R={ner_r:.3f} F1={nf:.3f} | "
+              f"Triple P={tri_p:.3f} R={tri_r:.3f} F1={tf:.3f}")
+        print(f"    [diag] triple_tp={triple_tp} triple_fp={triple_fp} triple_fn={triple_fn}")
+
     return {"ner_f1": nf, "triple_f1": tf, "n_examples": n_examples}
 
 
@@ -407,6 +447,7 @@ def main():
     if args.model_name is None:
         args.model_name = {
             "scierc": "allenai/scibert_scivocab_uncased",
+            "scier": "allenai/scibert_scivocab_uncased",
             "conll04": "bert-base-uncased",
             "ade": "allenai/scibert_scivocab_uncased",
         }.get(args.dataset, "bert-base-uncased")
@@ -593,6 +634,7 @@ def main():
                 model, dev_loader, device, ds_mod,
                 entity_type2id, id2entity_type,
                 max_span_width=args.max_span_width,
+                verbose=True,
             )
             star = ""
             if metrics["triple_f1"] > best_metrics["triple_f1"]:
