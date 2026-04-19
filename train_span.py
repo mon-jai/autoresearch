@@ -493,8 +493,16 @@ def main():
     if args.pretrain_ckpt:
         ckpt = torch.load(args.pretrain_ckpt, map_location=device)
         pretrained_sd = ckpt["discriminator"]
-        # Load backbone + adapter weights, skip task heads with strict=False
-        missing, unexpected = model.load_state_dict(pretrained_sd, strict=False)
+        # Filter out keys with shape mismatches (task heads differ across datasets)
+        model_sd = model.state_dict()
+        filtered_sd = {
+            k: v for k, v in pretrained_sd.items()
+            if k in model_sd and model_sd[k].shape == v.shape
+        }
+        skipped = [k for k in pretrained_sd if k not in filtered_sd]
+        if skipped:
+            print(f"  Skipping {len(skipped)} shape-mismatched keys: {skipped[:5]}...")
+        missing, unexpected = model.load_state_dict(filtered_sd, strict=False)
         # Reinitialize task-specific heads for fresh fine-tuning
         model.span_ner_head.reset_parameters()
         model.span_width_emb.reset_parameters()
