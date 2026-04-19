@@ -271,17 +271,24 @@ def build_dataloaders(tokenizer, data_dir=None, batch_size: int = 16,
     ent_test = _load_entities(data_dir / "entities" / "test.csv")
     rel_test = _load_relations(data_dir / "relations" / "test.csv", ent_test)
 
-    def _merge(ent_data, rel_data):
-        """Merge entity and relation data into examples list."""
+    def _merge(ent_data, rel_data, require_entities=False):
+        """Merge entity and relation data into examples list.
+        If require_entities=True, only include sentences that have entity annotations.
+        This is critical for test sets where entity and relation CSVs cover
+        different sentences — relation-only sentences have no NER ground truth.
+        """
         examples = []
-        all_ids = set(ent_data.keys()) | set(rel_data.keys())
+        if require_entities:
+            all_ids = set(ent_data.keys())  # only entity-annotated sentences
+        else:
+            all_ids = set(ent_data.keys()) | set(rel_data.keys())
         for eid in all_ids:
             if eid in ent_data:
                 words = ent_data[eid]["words"]
                 ner = ent_data[eid]["ner"]
             elif eid in rel_data:
                 words = rel_data[eid]["words"]
-                ner = []  # No entity annotations for relation-only examples
+                ner = []
             else:
                 continue
 
@@ -297,8 +304,8 @@ def build_dataloaders(tokenizer, data_dir=None, batch_size: int = 16,
             })
         return examples
 
-    train_examples = _merge(ent_train, rel_train)
-    test_examples = _merge(ent_test, rel_test)
+    train_examples = _merge(ent_train, rel_train, require_entities=False)
+    test_examples = _merge(ent_test, rel_test, require_entities=True)
 
     # Create dev split from training data
     rng = random.Random(seed)
