@@ -98,6 +98,10 @@ def parse_args():
                         "0 = disabled. When >0, negative spans overlapping gold "
                         "entities get loss weighted by (1 + iou_neg_weight * IoU). "
                         "SpERT.MT (2023) shows +2.88% RE on SciERC with IoU scaling.")
+    p.add_argument("--label-smoothing", type=float, default=0.0,
+                   help="Label smoothing for NER focal loss. 0 = disabled. "
+                        "0.05-0.1 recommended. Prevents overconfident predictions "
+                        "on hard boundary negatives.")
     args = p.parse_args()
     # Resolve cycle aliases
     if args.cycle_jsonl_alias and not args.synth_jsonl:
@@ -107,13 +111,15 @@ def parse_args():
     return args
 
 
-def focal_loss(logits, targets, gamma=2.0, weights=None):
+def focal_loss(logits, targets, gamma=2.0, weights=None, label_smoothing=0.0):
     """Focal loss for class-imbalanced classification.
 
     Args:
         weights: optional per-sample weights (same length as targets).
+        label_smoothing: label smoothing factor (0.0 = no smoothing).
     """
-    ce = F.cross_entropy(logits, targets, reduction="none")
+    ce = F.cross_entropy(logits, targets, reduction="none",
+                         label_smoothing=label_smoothing)
     pt = torch.exp(-ce)
     fl = (1 - pt) ** gamma * ce
     if weights is not None:
@@ -195,7 +201,8 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                       re_weight=1.0, neg_sample_ratio=0.5, max_span_width=8,
                       focal_gamma=2.0, cl_weight=0.0, cl_tau=0.1,
                       cl_entity_only=False, bio_weight=0.0,
-                      return_bio_logits=False, iou_neg_weight=0.0):
+                      return_bio_logits=False, iou_neg_weight=0.0,
+                      label_smoothing=0.0):
     """Compute span NER loss + RE loss + optional BIO auxiliary loss."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -295,7 +302,8 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                                     max_iou = max(max_iou, inter / union)
                             iou_weights[idx_k] = 1.0 + iou_neg_weight * max_iou
             span_loss = focal_loss(span_logits[keep_indices], targets[keep_indices],
-                                   gamma=focal_gamma, weights=iou_weights)
+                                   gamma=focal_gamma, weights=iou_weights,
+                                   label_smoothing=label_smoothing)
             span_losses.append(span_loss)
 
         # RE loss — use union of gold + predicted entity spans so the RE head
@@ -607,6 +615,7 @@ def main():
                 cl_entity_only=args.cl_entity_only,
                 bio_weight=bio_w_eff, return_bio_logits=True,
                 iou_neg_weight=args.iou_neg_weight,
+                label_smoothing=args.label_smoothing,
             )
             gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
                 model, batch, device, ds_mod, entity_type2id,
@@ -616,6 +625,7 @@ def main():
                 cl_entity_only=args.cl_entity_only,
                 bio_weight=bio_w_eff, return_bio_logits=True,
                 iou_neg_weight=args.iou_neg_weight,
+                label_smoothing=args.label_smoothing,
             )
             # Average the two losses + symmetric KL on BIO logits
             gold_loss = (gold_loss + gold_loss2) / 2
@@ -636,6 +646,7 @@ def main():
                 cl_entity_only=args.cl_entity_only,
                 bio_weight=bio_w_eff,
                 iou_neg_weight=args.iou_neg_weight,
+                label_smoothing=args.label_smoothing,
             )
 
         synth_loss_val = 0.0
@@ -650,6 +661,7 @@ def main():
                     cl_entity_only=args.cl_entity_only,
                     bio_weight=bio_w_eff,
                     iou_neg_weight=args.iou_neg_weight,
+                label_smoothing=args.label_smoothing,
                 )
                 synth_loss_val = s_loss.item()
                 total = gold_loss + args.synth_weight * s_loss
