@@ -346,7 +346,10 @@ def collate_fn(batch, pad_token_id: int = 0):
 
 
 # Data directory: expects cuad_repo/ with CUADv1.json, train_separate_questions.json, test.json
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "cuad_repo"
+# Check relative to project root first, then fallback to ~/data/cuad_repo (DGX layout)
+_LOCAL_DATA = Path(__file__).resolve().parent.parent.parent / "data" / "cuad_repo"
+_HOME_DATA = Path.home() / "data" / "cuad_repo"
+DEFAULT_DATA_DIR = _LOCAL_DATA if _LOCAL_DATA.exists() else _HOME_DATA
 
 
 def build_dataloaders(tokenizer, data_dir=None, batch_size: int = 16,
