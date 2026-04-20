@@ -102,6 +102,10 @@ def parse_args():
                    help="Label smoothing for NER focal loss. 0 = disabled. "
                         "0.05-0.1 recommended. Prevents overconfident predictions "
                         "on hard boundary negatives.")
+    p.add_argument("--re-focal-gamma", type=float, default=0.0,
+                   help="Focal loss gamma for RE head. 0 = standard CE (default). "
+                        "RE pairs are ~93%% NO_REL — focal loss downweights easy "
+                        "negatives so the model focuses on hard relation cases.")
     args = p.parse_args()
     # Resolve cycle aliases
     if args.cycle_jsonl_alias and not args.synth_jsonl:
@@ -202,7 +206,7 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                       focal_gamma=2.0, cl_weight=0.0, cl_tau=0.1,
                       cl_entity_only=False, bio_weight=0.0,
                       return_bio_logits=False, iou_neg_weight=0.0,
-                      label_smoothing=0.0):
+                      label_smoothing=0.0, re_focal_gamma=0.0):
     """Compute span NER loss + RE loss + optional BIO auxiliary loss."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -326,7 +330,11 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                 pair_targets = [rel_lookup.get((h, t), NO_REL) for (h, t) in pairs]
                 pair_targets_t = torch.tensor(pair_targets, device=device, dtype=torch.long)
                 re_logits = model.forward_re(hidden[b_idx], word_ids_list[b_idx], pairs)
-                re_losses.append(F.cross_entropy(re_logits, pair_targets_t))
+                if re_focal_gamma > 0:
+                    re_losses.append(focal_loss(re_logits, pair_targets_t,
+                                                gamma=re_focal_gamma))
+                else:
+                    re_losses.append(F.cross_entropy(re_logits, pair_targets_t))
 
     ner_loss = torch.stack(span_losses).mean() if span_losses else hidden.new_tensor(0.0)
     re_loss = torch.stack(re_losses).mean() if re_losses else hidden.new_tensor(0.0)
@@ -616,6 +624,7 @@ def main():
                 bio_weight=bio_w_eff, return_bio_logits=True,
                 iou_neg_weight=args.iou_neg_weight,
                 label_smoothing=args.label_smoothing,
+                re_focal_gamma=args.re_focal_gamma,
             )
             gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
                 model, batch, device, ds_mod, entity_type2id,
@@ -626,6 +635,7 @@ def main():
                 bio_weight=bio_w_eff, return_bio_logits=True,
                 iou_neg_weight=args.iou_neg_weight,
                 label_smoothing=args.label_smoothing,
+                re_focal_gamma=args.re_focal_gamma,
             )
             # Average the two losses + symmetric KL on BIO logits
             gold_loss = (gold_loss + gold_loss2) / 2
@@ -647,6 +657,7 @@ def main():
                 bio_weight=bio_w_eff,
                 iou_neg_weight=args.iou_neg_weight,
                 label_smoothing=args.label_smoothing,
+                re_focal_gamma=args.re_focal_gamma,
             )
 
         synth_loss_val = 0.0
@@ -662,6 +673,7 @@ def main():
                     bio_weight=bio_w_eff,
                     iou_neg_weight=args.iou_neg_weight,
                 label_smoothing=args.label_smoothing,
+                re_focal_gamma=args.re_focal_gamma,
                 )
                 synth_loss_val = s_loss.item()
                 total = gold_loss + args.synth_weight * s_loss
