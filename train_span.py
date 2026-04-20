@@ -106,6 +106,10 @@ def parse_args():
                    help="Focal loss gamma for RE head. 0 = standard CE (default). "
                         "RE pairs are ~93%% NO_REL — focal loss downweights easy "
                         "negatives so the model focuses on hard relation cases.")
+    p.add_argument("--re-train-conf", type=float, default=0.5,
+                   help="Confidence threshold for predicted spans used in RE training. "
+                        "Lower = more candidate pairs (noisier but more diverse). "
+                        "Higher = cleaner pairs but fewer training signals.")
     args = p.parse_args()
     # Resolve cycle aliases
     if args.cycle_jsonl_alias and not args.synth_jsonl:
@@ -206,7 +210,8 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                       focal_gamma=2.0, cl_weight=0.0, cl_tau=0.1,
                       cl_entity_only=False, bio_weight=0.0,
                       return_bio_logits=False, iou_neg_weight=0.0,
-                      label_smoothing=0.0, re_focal_gamma=0.0):
+                      label_smoothing=0.0, re_focal_gamma=0.0,
+                      re_train_conf=0.5):
     """Compute span NER loss + RE loss + optional BIO auxiliary loss."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -320,7 +325,7 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
             pred_confs_re = torch.softmax(span_logits, dim=-1).max(dim=-1).values.tolist()
         pred_span_set = set()
         for (s, e), etype_id, conf in zip(candidates, pred_types_re, pred_confs_re):
-            if etype_id > 0 and conf >= 0.5:
+            if etype_id > 0 and conf >= re_train_conf:
                 pred_span_set.add((s, e))
         re_spans = list(pred_span_set | gold_span_set)
         if len(re_spans) >= 2:
@@ -625,6 +630,7 @@ def main():
                 iou_neg_weight=args.iou_neg_weight,
                 label_smoothing=args.label_smoothing,
                 re_focal_gamma=args.re_focal_gamma,
+                re_train_conf=args.re_train_conf,
             )
             gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
                 model, batch, device, ds_mod, entity_type2id,
@@ -636,6 +642,7 @@ def main():
                 iou_neg_weight=args.iou_neg_weight,
                 label_smoothing=args.label_smoothing,
                 re_focal_gamma=args.re_focal_gamma,
+                re_train_conf=args.re_train_conf,
             )
             # Average the two losses + symmetric KL on BIO logits
             gold_loss = (gold_loss + gold_loss2) / 2
@@ -658,6 +665,7 @@ def main():
                 iou_neg_weight=args.iou_neg_weight,
                 label_smoothing=args.label_smoothing,
                 re_focal_gamma=args.re_focal_gamma,
+                re_train_conf=args.re_train_conf,
             )
 
         synth_loss_val = 0.0
@@ -674,6 +682,7 @@ def main():
                     iou_neg_weight=args.iou_neg_weight,
                 label_smoothing=args.label_smoothing,
                 re_focal_gamma=args.re_focal_gamma,
+                re_train_conf=args.re_train_conf,
                 )
                 synth_loss_val = s_loss.item()
                 total = gold_loss + args.synth_weight * s_loss
