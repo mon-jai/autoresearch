@@ -92,6 +92,11 @@ def parse_args():
                    help="Weight for R-Drop KL-divergence consistency loss. "
                         "0 = disabled. Passes batch twice with different dropout, "
                         "adds KL(p1||p2) + KL(p2||p1) on span NER logits.")
+    p.add_argument("--iou-neg-weight", type=float, default=0.0,
+                   help="IoU-based weight for hard negative spans. "
+                        "0 = disabled. When >0, negative spans overlapping gold "
+                        "entities get loss weighted by (1 + iou_neg_weight * IoU). "
+                        "SpERT.MT (2023) shows +2.88% RE on SciERC with IoU scaling.")
     args = p.parse_args()
     # Resolve cycle aliases
     if args.cycle_jsonl_alias and not args.synth_jsonl:
@@ -101,11 +106,18 @@ def parse_args():
     return args
 
 
-def focal_loss(logits, targets, gamma=2.0):
-    """Focal loss for class-imbalanced classification."""
+def focal_loss(logits, targets, gamma=2.0, weights=None):
+    """Focal loss for class-imbalanced classification.
+
+    Args:
+        weights: optional per-sample weights (same length as targets).
+    """
     ce = F.cross_entropy(logits, targets, reduction="none")
     pt = torch.exp(-ce)
-    return ((1 - pt) ** gamma * ce).mean()
+    fl = (1 - pt) ** gamma * ce
+    if weights is not None:
+        fl = fl * weights
+    return fl.mean()
 
 
 def supervised_contrastive_loss(span_vecs, labels, tau=0.1, entity_only=False):
@@ -182,7 +194,7 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                       re_weight=1.0, neg_sample_ratio=0.5, max_span_width=8,
                       focal_gamma=2.0, cl_weight=0.0, cl_tau=0.1,
                       cl_entity_only=False, bio_weight=0.0,
-                      return_bio_logits=False):
+                      return_bio_logits=False, iou_neg_weight=0.0):
     """Compute span NER loss + RE loss + optional BIO auxiliary loss."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -264,7 +276,25 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
         keep_indices = torch.cat([pos_mask.nonzero(as_tuple=True)[0], neg_indices])
 
         if len(keep_indices) > 0:
-            span_loss = focal_loss(span_logits[keep_indices], targets[keep_indices], gamma=focal_gamma)
+            # IoU-weighted hard negative loss (SpERT.MT 2023)
+            iou_weights = None
+            if iou_neg_weight > 0:
+                gold_spans_se = [(s, e) for (s, e, _) in gold_ents]
+                if gold_spans_se:
+                    iou_weights = torch.ones(len(keep_indices), device=device)
+                    kept_targets = targets[keep_indices]
+                    for idx_k, ki in enumerate(keep_indices.tolist()):
+                        if kept_targets[idx_k] == 0:  # negative span
+                            cs, ce_ = candidates[ki]
+                            max_iou = 0.0
+                            for gs, ge in gold_spans_se:
+                                inter = max(0, min(ce_, ge) - max(cs, gs) + 1)
+                                union = (ce_ - cs + 1) + (ge - gs + 1) - inter
+                                if union > 0:
+                                    max_iou = max(max_iou, inter / union)
+                            iou_weights[idx_k] = 1.0 + iou_neg_weight * max_iou
+            span_loss = focal_loss(span_logits[keep_indices], targets[keep_indices],
+                                   gamma=focal_gamma, weights=iou_weights)
             span_losses.append(span_loss)
 
         # RE loss — use union of gold + predicted entity spans so the RE head
@@ -575,6 +605,7 @@ def main():
                 cl_weight=args.cl_weight, cl_tau=args.cl_tau,
                 cl_entity_only=args.cl_entity_only,
                 bio_weight=bio_w_eff, return_bio_logits=True,
+                iou_neg_weight=args.iou_neg_weight,
             )
             gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
                 model, batch, device, ds_mod, entity_type2id,
@@ -583,6 +614,7 @@ def main():
                 cl_weight=args.cl_weight, cl_tau=args.cl_tau,
                 cl_entity_only=args.cl_entity_only,
                 bio_weight=bio_w_eff, return_bio_logits=True,
+                iou_neg_weight=args.iou_neg_weight,
             )
             # Average the two losses + symmetric KL on BIO logits
             gold_loss = (gold_loss + gold_loss2) / 2
@@ -602,6 +634,7 @@ def main():
                 cl_weight=args.cl_weight, cl_tau=args.cl_tau,
                 cl_entity_only=args.cl_entity_only,
                 bio_weight=bio_w_eff,
+                iou_neg_weight=args.iou_neg_weight,
             )
 
         synth_loss_val = 0.0
@@ -615,6 +648,7 @@ def main():
                     cl_weight=args.cl_weight, cl_tau=args.cl_tau,
                     cl_entity_only=args.cl_entity_only,
                     bio_weight=bio_w_eff,
+                    iou_neg_weight=args.iou_neg_weight,
                 )
                 synth_loss_val = s_loss.item()
                 total = gold_loss + args.synth_weight * s_loss
