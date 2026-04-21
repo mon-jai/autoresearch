@@ -544,7 +544,12 @@ def main():
     # Load ELECTRA cooperative pre-training checkpoint if provided
     if args.pretrain_ckpt:
         ckpt = torch.load(args.pretrain_ckpt, map_location=device)
-        pretrained_sd = ckpt["discriminator"]
+        if "discriminator" in ckpt:
+            pretrained_sd = ckpt["discriminator"]
+        elif "encoder" in ckpt:
+            pretrained_sd = ckpt["encoder"]
+        else:
+            pretrained_sd = ckpt
         # Filter out keys with shape mismatches (task heads differ across datasets)
         model_sd = model.state_dict()
         filtered_sd = {
@@ -563,8 +568,8 @@ def main():
             if hasattr(m, "reset_parameters"):
                 m.reset_parameters()
         print(f"  Loaded pre-trained weights from {args.pretrain_ckpt}")
-        print(f"    step={ckpt.get('step')}, mlm_acc={ckpt.get('mlm_acc', '?'):.4f}, rtd_acc={ckpt.get('rtd_acc', '?'):.4f}")
-        print(f"    missing keys: {len(missing)}, unexpected: {len(unexpected)}")
+        print(f"    loaded keys: {len(filtered_sd)}, skipped: {len(skipped)}")
+        print(f"    missing: {len(missing)}, unexpected: {len(unexpected)}")
 
     print(f"  span_ner_head:  {model.span_ner_head}")
     print(f"  re_head out:    {model.re_head[-1].out_features}")
