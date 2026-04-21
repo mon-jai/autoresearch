@@ -16,6 +16,7 @@ Usage:
 import argparse
 import importlib
 import random
+import sys
 import time
 from pathlib import Path
 
@@ -707,8 +708,13 @@ def main():
             cl_str = f" CL={cl_loss.item():.4f}" if use_cl else ""
             bio_str = f" BIO={bio_l.item():.4f}(w={bio_w_eff:.3f})" if bio_w_eff > 0 else ""
             rdrop_str = f" RD={rdrop_loss.item():.4f}" if use_rdrop else ""
-            print(f"[Step {step:04d}] L={gold_loss.item():.4f} NER={ner_loss.item():.4f} "
-                  f"RE={re_loss.item():.4f}{cl_str}{bio_str}{rdrop_str} synth={synth_loss_val:.4f} lr={cur_lr:.2e} | {dt:.0f}ms/step")
+            msg = (f"[Step {step:04d}] L={gold_loss.item():.4f} NER={ner_loss.item():.4f} "
+                   f"RE={re_loss.item():.4f}{cl_str}{bio_str}{rdrop_str} synth={synth_loss_val:.4f} lr={cur_lr:.2e} | {dt:.0f}ms/step")
+            print(msg)
+            sys.stdout.flush()
+            # Write progress to file for monitoring
+            with open("/tmp/train_progress.txt", "a") as _pf:
+                _pf.write(msg + "\n")
 
         if step > 0 and step % args.eval_every == 0:
             metrics = evaluate_span(
@@ -727,8 +733,12 @@ def main():
                     save_path.parent.mkdir(parents=True, exist_ok=True)
                     torch.save({"encoder": model.state_dict(), "step": step,
                                 "metrics": metrics}, save_path)
-            print(f"[Eval @ {step}] NER={metrics['ner_f1']:.4f} "
-                  f"Triple={metrics['triple_f1']:.4f}{star}")
+            eval_msg = (f"[Eval @ {step}] NER={metrics['ner_f1']:.4f} "
+                        f"Triple={metrics['triple_f1']:.4f}{star}")
+            print(eval_msg)
+            sys.stdout.flush()
+            with open("/tmp/train_progress.txt", "a") as _pf:
+                _pf.write(eval_msg + "\n")
             model.train()
 
         step += 1
@@ -742,11 +752,19 @@ def main():
         if split_name == "dev" and metrics["triple_f1"] > best_metrics["triple_f1"]:
             best_metrics = dict(metrics)
             best_step = step
-        print(f"\n=== {split_name.upper()} (step {step}) ===")
-        print(f"  NER={metrics['ner_f1']:.4f} Triple={metrics['triple_f1']:.4f}")
-    print(f"=== BEST DEV (step {best_step}) ===")
-    print(f"  NER={best_metrics['ner_f1']:.4f} Triple={best_metrics['triple_f1']:.4f}")
-    print(f"  time={time.time()-t0:.1f}s")
+        msg = (f"\n=== {split_name.upper()} (step {step}) ===\n"
+               f"  NER={metrics['ner_f1']:.4f} Triple={metrics['triple_f1']:.4f}")
+        print(msg)
+        sys.stdout.flush()
+        with open("/tmp/train_progress.txt", "a") as _pf:
+            _pf.write(msg + "\n")
+    final_msg = (f"=== BEST DEV (step {best_step}) ===\n"
+                 f"  NER={best_metrics['ner_f1']:.4f} Triple={best_metrics['triple_f1']:.4f}\n"
+                 f"  time={time.time()-t0:.1f}s")
+    print(final_msg)
+    sys.stdout.flush()
+    with open("/tmp/train_progress.txt", "a") as _pf:
+        _pf.write(final_msg + "\n")
 
 
 if __name__ == "__main__":

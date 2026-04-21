@@ -1,0 +1,56 @@
+e375058	1.2305	0.6557	discard	Gumbel tau=0.5 (worse L_rec, still oscillating)
+a54bb78	1.1151	0.6514	discard	batch_size=16 (best-ever 0.73 but final worse, oscillation)
+639da75	1.6297	0.6548	discard	EMA encoder decay=0.999 (smoother but stuck at higher L_rec)
+45fc36f	5.9138	0.6624	discard	InfoNCE tau=0.1 + self-adversarial (tau too aggressive, worse than random)
+848b441	4.4036	0.6569	discard	InfoNCE tau=1.0 (encoder output not cosine-compatible, needs projection head)
+c6f086a	0.6035	0.6586	discard	self-adversarial weighted margin=0.3 (more stable but final L_rec worse than exp9)
+37ec32d	1.1153	0.6560	discard	self-adversarial margin=0.5 (worse than exp9, multi-neg changes loss scale)
+a311316	1.0520	0.6506	discard	1000 steps (best-ever 0.15 at step 990 but final oscillated back up)
+d3f0167	0.3556	0.6518	keep	batch_size 4→16 (variance reduction, oscillation halved, new best final=0.36, best-ever=0.12)
+2820309	0.0766	0.6513	discard	exp20: BATCH_SIZE 16→32 (less oscillation but worse final 0.0766>0.0712, best-ever 0.0722)
+3bb5e1b	0.0584	0.6515	keep	exp21: margin 0.1→0.05 (best-ever 0.0288, final 0.0584, EMA 0.0699, huge win)
+0afd0ef	0.0168	0.6514	keep	exp22: margin 0.05→0.02 (MILESTONE <0.01! best-ever 0.0092, final 0.0168, EMA 0.0221)
+1386188	0.0477	0.6513	discard	exp23: direct MSE alpha=0.1 (worse: L_rec 0.0477>0.0168, MSE term hurt contrastive convergence)
+63040ce	0.0085	0.6513	keep	exp24: margin 0.02→0.01 (best-ever 0.0051, final 0.0085, EMA 0.0088, improved from exp22)
+90f527c	0.0125	0.6520	discard	exp25: margin 0.01→0.005 (worse final 0.0125>0.0085, more oscillation late, best-ever same 0.0051)
+6639ec8	0.0137	0.6512	discard	exp26: 1500 steps + LR end_factor 0.05 (worse: final 0.0137>0.0085, oscillation not reduced)
+0ba4a6e	0.0132	0.6514	discard	exp27: encoder LR 3e-4→1e-4 (worse: final 0.0132>0.0085, slower convergence)
+1f7cc22	0.0022	0.6516	keep	exp28: data noise 0.05→0.02 (best-ever 0.0022! final=best=step999, EMA 0.0056, noise was the floor)
+3a5f611	0.0042	0.6529	discard	exp29: data noise 0.02→0.01 (worse: final 0.0042>0.0022, more oscillation)
+a0a7892	0.0075	0.6528	discard	exp30: K=4 hard negatives (worse: final 0.0075>0.0022, extra neg compute didn't help)
+13d4392	0.0153	0.6514	discard	exp31: cosine distance (best-ever 0.0019! but final 0.0153>0.0022, much more oscillation)
+6c1af67	0.0144	0.6517	discard	exp32: cosine+LR1e-4 (best-ever 0.0009!! but final 0.0144>0.0022, oscillation still bad)
+67ca566	0.0000	0.6512	keep	exp33: cosine+grad_norm0.3 (L_rec=0.0000!! EMA 0.0015, cosine oscillation fully tamed)
+3a2b805	0.0045	0.6520	discard	exp34: cosine margin 0.01→0.005 (worse: final 0.0045>0.0000)
+e82fd07	0.0204	0.6525	discard	exp35: data noise 0.02→0.01 with cosine (worse: 0.0204>0.0000, cosine needs more noise for training signal)
+175faa8	0.0096	0.6515	discard	exp36: BS 16→32 with cosine+GN0.3 (worse: final 0.0096>0.0000, lost useful stochasticity)
+1f9f664	0.0043	0.6510	discard	exp37: 2000 steps (final 0.0043>0.0000, but EMA hit 0.0000 at step 1950, more stable late training)
+67ca566	0.0038	0.6511	discard	exp38: reproducibility run of exp33 (final 0.0038, best-ever 0.0010, EMA 0.0027, confirms exp33 0.0000 was lucky)
+49dee17	0.0056	0.6516	discard	exp39: margin annealing 0.05→0.001 (worse: final 0.0056>0.0000, high early margin hurt convergence)
+20a86b3	0.0112	0.6529	discard	exp40: encoder LR warmup 50 steps (worse: final 0.0112>0.0000, warmup slowed convergence)
+6f0c221	0.0061	0.6512	discard	exp41: two-phase encoder LR, 1% at step 800 (better: oscillation narrowed 0.002-0.013, but final 0.0061>0.0000)
+cd61a46	0.0079	0.6516	discard	exp42: KBGAN freeze + encoder LR drop (bug: scheduler overrode LR, still 0.002-0.020 range)
+03744d3	0.0088	0.6517	keep	exp43: 20-batch EMA eval (L_rec_avg20=0.0088, std=0.0051, reveals exp33 0.0000 was 1.7σ outlier)
+2fbce7e	0.0108	0.6517	discard	exp44: encoder LR freeze at 800 (worse: avg20 0.0108>0.0088, encoder stopped adapting)
+6fe5d74	0.0109	0.6516	discard	exp45: cosine KBGAN reward (worse: avg20 0.0109>0.0088, harder negs caused instability)
+89aff6e	0.0141	0.6510	discard	exp46: margin 0.005 (worse: ref01 0.0141>0.0088, weaker training signal)
+e846754	0.0128	0.6517	discard	exp47: SimCLR projection heads (worse: avg20 0.0128>0.0088, more params need longer training)
+fb0c0de	0.0076	0.6515	keep	exp48: projection heads + 2000 steps (NEW BEST avg20=0.0076, std=0.0039, 14% improvement over exp43)
+26eeaa6	0.0080	0.6509	discard	exp49: 3000 steps (avg20 0.0080>0.0076, diminishing returns, std improved 0.0039→0.0032)
+3ed1afc	0.0108	0.6509	discard	exp50: grad_norm 0.3→0.5 (worse: avg20 0.0108>0.0076, more oscillation with looser clip)
+adb3bc5	0.0096	0.6518	discard	exp51: noise 0.02→0.015 (worse: avg20 0.0096>0.0076, less noise reduced training signal)
+877013a	0.0103	0.6515	discard	exp52: grad_norm 0.3→0.2 (worse: avg20 0.0103>0.0076, too tight slowed convergence)
+b2c3625	0.0113	0.6517	discard	exp53: EMA 0.999→0.995 (worse: avg20 0.0113>0.0076, faster EMA hurt eval stability)
+-	0.0094	-	discard	exp61: 4000 steps + cosine warm-restart encoder LR (worse, LR boosts disrupted convergence)
+	0.0029	0.6520	keep	exp89: n_layer 6→8 (L_rec -21%, std -18%, new best avg100=0.0029±0.0009)
+-	0.3156	-	discard	BERT-base ACCORD neg=3.0 bio=0.1 iou_neg_weight=1.0 3500 steps: Best dev Triple=0.316 NER=0.576 (step 2800). IoU-weighted hard negative loss HURTS Triple by -0.044 vs baseline (0.360). Boundary-overlapping negatives get over-penalized, degrading both NER and RE.
+-	0.2929	-	discard	BERT-base ACCORD neg=3.0 bio=0.1 iou_neg_weight=0.5 2800 steps: Best dev Triple=0.293 NER=0.613 (step 1300). IoU=0.5 even worse than IoU=1.0 (0.316). IoU-weighted hard negative loss direction is confirmed negative. The NER focal loss with gamma=2.0 already handles hard negatives well.
+-	0.2844	-	discard	BERT-base ACCORD neg=3.0 bio=0.1 label_smoothing=0.1 2800 steps: Best dev Triple=0.284 NER=0.607 (step 1900). Label smoothing improves early NER (0.633 vs 0.579 at step 900) but cripples RE (-21.1% Triple vs baseline 0.360). Softer span predictions hurt the RE head which needs sharp entity boundaries.
+-	0.3368	-	discard	BERT-base ACCORD neg=3.0 bio=0.1 re_focal_gamma=2.0 2800 steps: Best dev Triple=0.337 NER=0.657 (step 1200). RE focal loss dramatically improves NER (+6.1% from 0.619→0.657) but Triple still below baseline (0.360). gamma=2.0 too aggressive on RE. Try gamma=1.0.
+-	0.3008	-	discard	BERT-base ACCORD neg=3.0 bio=0.1 re_focal_gamma=1.0 2800 steps: Best dev Triple=0.301 NER=0.598 (step 1000). Weaker than gamma=2.0 (0.337) and baseline (0.360). RE focal loss does not help Triple, though gamma=2.0 variant gives better NER (+6%). The CE loss on RE is already well-calibrated for this imbalance.
+-	0.3527	-	discard	BERT-base ACCORD neg=3.0 bio=0.1 re_train_conf=0.3 2800 steps: Best dev Triple=0.353 NER=0.603 (step 2200). Within baseline variance (0.333±0.019). Lower confidence threshold gives more RE training pairs but adds noise. Not a clear improvement over conf=0.5 baseline (0.360).
+-	0.3727	-	keep	BERT-base ACCORD neg=3.0 bio=0.1 re_focal_gamma=2.0 re_train_conf=0.3 2800 steps: Best dev Triple=0.373 NER=0.636 (step 1500). NEW BEST. +3.6% Triple over baseline (0.360). RE focal loss focuses on hard relation pairs while lower conf threshold provides more diverse entity pairs. Both NER and Triple improved.
+-	0.3185	-	discard	RE focal+conf multi-seed verification (4 seeds, 1500 steps): mean Triple=0.318±0.016 (s42=0.329, s43=0.307, s44=0.303, s45=0.336). BELOW baseline 0.333±0.019. The 0.373 single-run result was an outlier. RE focal+conf does not consistently improve at 1500 steps. Testing 2800 steps.
+-	0.3888	-	keep	BERT-base ACCORD neg=3.0 bio=0.1 re_focal_gamma=2.0 re_train_conf=0.3 2800 steps seed 42: Best dev Triple=0.389 NER=0.641 (step 1600). NEW BEST. +4.2% over previous best (0.373). Confirms focal+conf needs ≥2800 steps. Peak at step 1600, slight degradation after 2000.
+-	0.3319	-	discard	RE focal+conf 4-seed verification (2800 steps): mean Triple=0.332±0.039 (s42=0.389, s43=0.301, s44=0.327, s45=0.311). Identical to baseline 0.333±0.019 but with 2x variance. The 0.373 single-run was a seed outlier. RE focal+conf is NOT a real improvement — it amplifies variance. Seed 42 gives consistently high results (0.389 this run) due to favorable train/dev split.
+-	0.3375	-	keep	Baseline 4-seed verification (2800 steps, no focal+conf): mean Triple=0.338±0.023 (s42=0.352, s43=0.307, s44=0.335, s45=0.357). Paired comparison with focal+conf: delta=-0.006 (-1.7%). Focal+conf does NOT improve mean; increases variance from 0.023→0.039. Seed 42 is a favorable split (+10.6%), seeds 43-45 regress. The 0.373 published result was seed-dependent.
