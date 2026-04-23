@@ -116,7 +116,9 @@ class BertKGExtractor(nn.Module):
                  use_crf: bool = False,
                  num_bio_tags: int = None, num_relations: int = None,
                  num_entity_types: int = None, use_span_ner: bool = False,
-                 max_span_width: int = 8, bio_enrich: str = "none"):
+                 max_span_width: int = 8, bio_enrich: str = "none",
+                 boundary_reg: bool = False,
+                 boundary_refine: bool = False):
         super().__init__()
         self.backbone = BertBackbone(model_name)
         hidden = self.backbone.hidden_size
@@ -150,6 +152,18 @@ class BertKGExtractor(nn.Module):
             self.span_ner_head = nn.Linear(span_in_dim, n_ent + 1)
             self.span_width_emb = nn.Embedding(max_span_width, hidden)
             self.span_width_proj = nn.Linear(hidden, hidden * 3)  # project width emb to 3H
+
+        # ── Boundary regression head (predicts Δ_start, Δ_end offsets) ───
+        self.boundary_reg = boundary_reg
+        if boundary_reg and use_span_ner:
+            self.boundary_reg_head = nn.Linear(span_in_dim, 2)  # (Δ_start, Δ_end)
+
+        # ── SRT-style boundary refinement (1D conv over span vectors) ───
+        self.boundary_refine = boundary_refine
+        if boundary_refine and use_span_ner:
+            self.boundary_refine_conv = nn.Conv1d(
+                span_in_dim, span_in_dim, kernel_size=3, padding=1)
+            self.boundary_refine_norm = nn.LayerNorm(span_in_dim)
 
         # RE head — 2H concat + 2-layer MLP.
         self.re_head = nn.Sequential(
@@ -207,6 +221,80 @@ class BertKGExtractor(nn.Module):
     def forward_ner(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.ner_head(self.dropout(hidden_states))  # (B, T, NUM_BIO_TAGS)
 
+    @staticmethod
+    def bio_guided_proposals(bio_logits_b: torch.Tensor, word_ids_b: list,
+                             num_words: int, expand: int = 1,
+                             conf_threshold: float = 0.0) -> list:
+        """Decode BIO logits into span proposals for one example.
+
+        Extracts B→I* sequences from argmax BIO predictions, then expands
+        each by ±expand words to create boundary-variant candidates.
+
+        Args:
+            bio_logits_b: (T, NUM_BIO_TAGS) logits from BIO head.
+            word_ids_b: list mapping subword positions to word indices.
+            num_words: number of words in this example.
+            expand: how many words to expand each proposal boundary.
+            conf_threshold: minimum softmax confidence to keep a proposal.
+
+        Returns:
+            List of (start, end_inclusive) word-level spans.
+        """
+        preds = bio_logits_b.argmax(dim=-1).tolist()  # (T,)
+        confs = bio_logits_b.softmax(dim=-1).max(dim=-1).values.tolist()
+
+        # Map subword predictions to word-level by majority vote
+        word_tags = [0] * num_words  # default O
+        word_confs = [0.0] * num_words
+        word_counts = [0] * num_words
+        for tok_idx, wid in enumerate(word_ids_b):
+            if wid is not None and 0 <= wid < num_words:
+                # Take the first subword's prediction (B- tag is on first subword)
+                if word_counts[wid] == 0:
+                    word_tags[wid] = preds[tok_idx]
+                    word_confs[wid] = confs[tok_idx]
+                word_counts[wid] += 1
+
+        # Extract B→I* spans
+        bio_spans = []
+        i = 0
+        while i < num_words:
+            tag_id = word_tags[i]
+            tag_str = ID2BIO.get(tag_id, "O")
+            if tag_str.startswith("B-"):
+                start = i
+                end = i
+                avg_conf = word_confs[i]
+                j = i + 1
+                while j < num_words:
+                    next_tag = ID2BIO.get(word_tags[j], "O")
+                    if next_tag.startswith("I-"):
+                        end = j
+                        avg_conf += word_confs[j]
+                        j += 1
+                    else:
+                        break
+                avg_conf /= (end - start + 1)
+                if avg_conf >= conf_threshold:
+                    bio_spans.append((start, end))
+                i = j
+            else:
+                i += 1
+
+        # Expand each span by ±expand and generate boundary variants
+        proposals = set()
+        for (s, e) in bio_spans:
+            # Original span
+            proposals.add((s, e))
+            # Boundary variants
+            for ds in range(-expand, expand + 1):
+                for de in range(-expand, expand + 1):
+                    ns, ne = s + ds, e + de
+                    if 0 <= ns <= ne < num_words:
+                        proposals.add((ns, ne))
+
+        return sorted(proposals)
+
     def _first_token_for_word(self, word_ids_b: list, word_idx: int) -> int:
         """Return the first token index mapped to word_idx."""
         for i, wid in enumerate(word_ids_b):
@@ -240,7 +328,8 @@ class BertKGExtractor(nn.Module):
     def forward_span_ner(self, hidden_states_b: torch.Tensor, word_ids_b: list,
                          num_words: int, max_span_width: int = 8,
                          return_span_vecs: bool = False,
-                         bio_logits_b: torch.Tensor = None):
+                         bio_logits_b: torch.Tensor = None,
+                         bio_proposals: list = None):
         """
         Span-based NER v2: enumerate candidate spans, compute SpERT-style
         span representations [start; end; max_pool], classify as entity
@@ -250,6 +339,9 @@ class BertKGExtractor(nn.Module):
             bio_logits_b: (T, NUM_BIO_TAGS) optional BIO logits for this example.
                 Used when bio_enrich != "none" to concatenate averaged BIO features
                 per span into the span vector (STSN-inspired enrichment).
+            bio_proposals: optional list of (start, end_inclusive) spans from BIO
+                decoder. These are merged with exhaustive candidates, allowing
+                spans wider than max_span_width to be considered.
 
         Returns:
             span_logits: (num_candidates, num_entity_types + 1)
@@ -258,10 +350,17 @@ class BertKGExtractor(nn.Module):
         """
         if not hasattr(self, "span_ner_head"):
             raise RuntimeError("span_ner_head not initialized. Use use_span_ner=True.")
-        candidates = []
+        # Exhaustive enumeration up to max_span_width
+        candidate_set = set()
         for s in range(num_words):
             for e in range(s, min(s + max_span_width, num_words)):
-                candidates.append((s, e))
+                candidate_set.add((s, e))
+        # Merge BIO-guided proposals (can exceed max_span_width)
+        if bio_proposals:
+            for (s, e) in bio_proposals:
+                if 0 <= s <= e < num_words:
+                    candidate_set.add((s, e))
+        candidates = sorted(candidate_set)
         if not candidates:
             empty = hidden_states_b.new_zeros((0, self.span_ner_head.out_features))
             return (empty, [], None) if return_span_vecs else (empty, [])
@@ -299,9 +398,29 @@ class BertKGExtractor(nn.Module):
             bio_feats = torch.stack(bio_feats, dim=0)  # (N, NUM_BIO_TAGS)
             span_vecs = torch.cat([span_vecs, bio_feats], dim=-1)  # (N, 3H + NUM_BIO_TAGS)
 
-        logits = self.span_ner_head(self.dropout(span_vecs))
+        dropped = self.dropout(span_vecs)
+
+        # SRT-style boundary refinement: 1D conv over span dimension
+        if self.boundary_refine and hasattr(self, 'boundary_refine_conv'):
+            # dropped: (N, D) -> Conv1d expects (1, D, N)
+            x = dropped.unsqueeze(0).permute(0, 2, 1)
+            x = self.boundary_refine_conv(x)
+            x = x.permute(0, 2, 1).squeeze(0)  # back to (N, D)
+            dropped = self.boundary_refine_norm(dropped + x)
+
+        logits = self.span_ner_head(dropped)
+
+        # Boundary regression: predict (Δ_start, Δ_end) for each candidate
+        boundary_offsets = None
+        if self.boundary_reg and hasattr(self, "boundary_reg_head"):
+            boundary_offsets = self.boundary_reg_head(dropped)  # (N, 2)
+
         if return_span_vecs:
+            if boundary_offsets is not None:
+                return logits, candidates, span_vecs, boundary_offsets
             return logits, candidates, span_vecs
+        if boundary_offsets is not None:
+            return logits, candidates, boundary_offsets
         return logits, candidates
 
     def span_repr(self, hidden_states: torch.Tensor, word_ids_list: list, span: tuple) -> torch.Tensor:

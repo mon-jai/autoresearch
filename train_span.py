@@ -111,6 +111,27 @@ def parse_args():
                    help="Confidence threshold for predicted spans used in RE training. "
                         "Lower = more candidate pairs (noisier but more diverse). "
                         "Higher = cleaner pairs but fewer training signals.")
+    p.add_argument("--span-proposal", action="store_true",
+                   help="Use BIO-guided span proposals: merge BIO-decoded spans "
+                        "(with boundary expansion) into exhaustive candidates. "
+                        "Allows spans wider than max-span-width via BIO guidance.")
+    p.add_argument("--span-proposal-expand", type=int, default=1,
+                   help="Boundary expansion for BIO proposals (±N words). Default 1.")
+    p.add_argument("--boundary-reg", action="store_true",
+                   help="Add boundary regression head: predict (Δ_start, Δ_end) offsets "
+                        "to refine span boundaries. Trained with smooth L1 loss.")
+    p.add_argument("--boundary-reg-weight", type=float, default=0.1,
+                   help="Weight for boundary regression loss.")
+    p.add_argument("--boundary-refine", action="store_true",
+                   help="Add 1D conv boundary refinement module (SRT-style). "
+                        "Applies learnable 1D conv over span vectors to capture "
+                        "local boundary patterns before NER classification.")
+    p.add_argument("--eer-alpha", type=float, default=0.0,
+                   help="Expected Entity Ratio loss alpha. 0 = disabled. "
+                        "When >0, negative span losses are downweighted by "
+                        "(1 - alpha * entity_density) where entity_density = "
+                        "n_gold_entities / n_candidates. Treats unannotated "
+                        "tokens as latent variables (Effland & Collins 2021).")
     args = p.parse_args()
     # Resolve cycle aliases
     if args.cycle_jsonl_alias and not args.synth_jsonl:
@@ -212,7 +233,9 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                       cl_entity_only=False, bio_weight=0.0,
                       return_bio_logits=False, iou_neg_weight=0.0,
                       label_smoothing=0.0, re_focal_gamma=0.0,
-                      re_train_conf=0.5):
+                      re_train_conf=0.5,
+                      span_proposal=False, span_proposal_expand=1,
+                      boundary_reg_weight=0.0, eer_alpha=0.0):
     """Compute span NER loss + RE loss + optional BIO auxiliary loss."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -227,7 +250,7 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
     # Also compute BIO logits when bio_enrich needs them for span repr
     bio_loss = hidden.new_tensor(0.0)
     bio_logits = None
-    need_bio = bio_weight > 0 or return_bio_logits or model.bio_enrich != "none"
+    need_bio = bio_weight > 0 or return_bio_logits or model.bio_enrich != "none" or span_proposal
     if need_bio:
         ner_labels = batch["ner_labels"].to(device)
         bio_logits = model.forward_ner(hidden)  # (B, T, NUM_BIO_TAGS)
@@ -254,21 +277,44 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
         # BIO logits for this example (for bio_enrich)
         bio_logits_b = bio_logits[b_idx].detach() if bio_logits is not None else None
 
+        # BIO-guided span proposals (merge with exhaustive candidates)
+        bio_props = None
+        if span_proposal and bio_logits_b is not None:
+            bio_props = BertKGExtractor.bio_guided_proposals(
+                bio_logits_b, word_ids_list[b_idx], n_words,
+                expand=span_proposal_expand,
+            )
+
         # Span NER (optionally return span vectors for contrastive loss)
+        # forward_span_ner returns extra boundary_offsets when boundary_reg=True
+        use_breg = boundary_reg_weight > 0 and hasattr(model, 'boundary_reg') and model.boundary_reg
+        boundary_offsets = None
         if use_cl:
-            span_logits, candidates, span_vecs = model.forward_span_ner(
+            result = model.forward_span_ner(
                 hidden[b_idx], word_ids_list[b_idx], n_words, max_span_width,
                 return_span_vecs=True, bio_logits_b=bio_logits_b,
+                bio_proposals=bio_props,
             )
+            if use_breg:
+                span_logits, candidates, span_vecs, boundary_offsets = result
+            else:
+                span_logits, candidates, span_vecs = result
         else:
-            span_logits, candidates = model.forward_span_ner(
+            result = model.forward_span_ner(
                 hidden[b_idx], word_ids_list[b_idx], n_words, max_span_width,
-                bio_logits_b=bio_logits_b,
+                bio_logits_b=bio_logits_b, bio_proposals=bio_props,
             )
+            if use_breg:
+                span_logits, candidates, boundary_offsets = result
+            else:
+                span_logits, candidates = result
         if not candidates:
             continue
 
-        gold_labels = _build_span_labels(gold_ents, n_words, max_span_width, entity_type2id)
+        # _build_span_labels needs to cover BIO-proposed spans too (may exceed max_span_width)
+        gold_labels = _build_span_labels(gold_ents, n_words,
+                                         max(max_span_width, 64) if bio_props else max_span_width,
+                                         entity_type2id)
 
         # Build target tensor
         targets = []
@@ -294,12 +340,14 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
         keep_indices = torch.cat([pos_mask.nonzero(as_tuple=True)[0], neg_indices])
 
         if len(keep_indices) > 0:
+            # Per-sample weights for negative spans
+            sample_weights = None
+
             # IoU-weighted hard negative loss (SpERT.MT 2023)
-            iou_weights = None
             if iou_neg_weight > 0:
                 gold_spans_se = [(s, e) for (s, e, _) in gold_ents]
                 if gold_spans_se:
-                    iou_weights = torch.ones(len(keep_indices), device=device)
+                    sample_weights = torch.ones(len(keep_indices), device=device)
                     kept_targets = targets[keep_indices]
                     for idx_k, ki in enumerate(keep_indices.tolist()):
                         if kept_targets[idx_k] == 0:  # negative span
@@ -310,11 +358,46 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                                 union = (ce_ - cs + 1) + (ge - gs + 1) - inter
                                 if union > 0:
                                     max_iou = max(max_iou, inter / union)
-                            iou_weights[idx_k] = 1.0 + iou_neg_weight * max_iou
+                            sample_weights[idx_k] = 1.0 + iou_neg_weight * max_iou
+
+            # EER loss: downweight negatives by expected entity density
+            # (Effland & Collins, TACL 2021 — treat unannotated as latent)
+            if eer_alpha > 0 and len(candidates) > 0:
+                entity_density = n_pos / len(candidates)
+                if sample_weights is None:
+                    sample_weights = torch.ones(len(keep_indices), device=device)
+                kept_targets = targets[keep_indices]
+                neg_weight = max(1.0 - eer_alpha * entity_density, 0.1)
+                sample_weights[kept_targets == 0] *= neg_weight
+
             span_loss = focal_loss(span_logits[keep_indices], targets[keep_indices],
-                                   gamma=focal_gamma, weights=iou_weights,
+                                   gamma=focal_gamma, weights=sample_weights,
                                    label_smoothing=label_smoothing)
             span_losses.append(span_loss)
+
+        # Boundary regression loss: smooth L1 on (Δ_start, Δ_end) for positive spans
+        if use_breg and boundary_offsets is not None:
+            if gold_ents:
+                breg_preds = []
+                breg_targets = []
+                for idx_c, (cs, ce) in enumerate(candidates):
+                    if targets[idx_c] > 0:  # positive span — has a matching gold
+                        # Find the gold span with same type assignment
+                        gs, ge = cs, ce  # default: no offset
+                        for (g_s, g_e, g_t) in gold_ents:
+                            if entity_type2id.get(g_t, 0) == targets[idx_c].item():
+                                # Check overlap
+                                if not (ce < g_s or g_e < cs):
+                                    gs, ge = g_s, g_e
+                                    break
+                        breg_preds.append(boundary_offsets[idx_c])
+                        breg_targets.append(torch.tensor(
+                            [gs - cs, ge - ce], device=device, dtype=torch.float))
+                if breg_preds:
+                    breg_preds = torch.stack(breg_preds)
+                    breg_targets = torch.stack(breg_targets)
+                    breg_loss = F.smooth_l1_loss(breg_preds, breg_targets)
+                    span_losses.append(boundary_reg_weight * breg_loss)
 
         # RE loss — use union of gold + predicted entity spans so the RE head
         # is trained on the same noisy-entity distribution it sees at eval time.
@@ -360,7 +443,8 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
 
 
 def evaluate_span(model, dataloader, device, ds_mod, entity_type2id, id2entity_type,
-                  max_span_width=8, span_threshold=0.5, verbose=False):
+                  max_span_width=8, span_threshold=0.5, verbose=False,
+                  span_proposal=False, span_proposal_expand=1):
     """Evaluate with span-based NER predictions feeding into RE."""
     from eval.triple_f1 import _prf
     model.eval()
@@ -387,9 +471,9 @@ def evaluate_span(model, dataloader, device, ds_mod, entity_type2id, id2entity_t
 
             hidden = model.encode(modality="text", input_ids=input_ids, attention_mask=attention_mask)
 
-            # Compute BIO logits for bio_enrich (STSN-style span enrichment)
+            # Compute BIO logits for bio_enrich and/or span proposals
             bio_logits = None
-            if model.bio_enrich != "none":
+            if model.bio_enrich != "none" or span_proposal:
                 bio_logits = model.forward_ner(hidden)  # (B, T, NUM_BIO_TAGS)
 
             for b_idx in range(input_ids.size(0)):
@@ -399,10 +483,24 @@ def evaluate_span(model, dataloader, device, ds_mod, entity_type2id, id2entity_t
                 gold_rels = gold_relations_list[b_idx]
                 bio_logits_b = bio_logits[b_idx] if bio_logits is not None else None
 
-                span_logits, candidates = model.forward_span_ner(
+                # BIO-guided span proposals for eval
+                bio_props = None
+                if span_proposal and bio_logits_b is not None:
+                    bio_props = BertKGExtractor.bio_guided_proposals(
+                        bio_logits_b, word_ids_list[b_idx], n_words,
+                        expand=span_proposal_expand,
+                    )
+
+                use_breg = hasattr(model, 'boundary_reg') and model.boundary_reg
+                result = model.forward_span_ner(
                     hidden[b_idx], word_ids_list[b_idx], n_words, max_span_width,
-                    bio_logits_b=bio_logits_b,
+                    bio_logits_b=bio_logits_b, bio_proposals=bio_props,
                 )
+                if use_breg:
+                    span_logits, candidates, boundary_offsets = result
+                else:
+                    span_logits, candidates = result
+                    boundary_offsets = None
 
                 total_gold_ents += len(gold_ents)
                 gold_full = {(h, t, r) for (h, t, r) in gold_rels}
@@ -418,16 +516,24 @@ def evaluate_span(model, dataloader, device, ds_mod, entity_type2id, id2entity_t
                 pred_types = span_logits.argmax(dim=-1).tolist()
                 pred_confs = span_probs.max(dim=-1).values.tolist()
 
-                pred_spans = []
-                for (s, e), etype_id, conf in zip(candidates, pred_types, pred_confs):
+                pred_spans = []  # (s, e, etype, conf)
+                for idx_c, ((s, e), etype_id, conf) in enumerate(
+                        zip(candidates, pred_types, pred_confs)):
                     if etype_id > 0 and conf >= span_threshold:
+                        # Apply boundary regression offsets
+                        if boundary_offsets is not None:
+                            ds = round(boundary_offsets[idx_c, 0].item())
+                            de = round(boundary_offsets[idx_c, 1].item())
+                            s_new = max(0, min(s + ds, n_words - 1))
+                            e_new = max(s_new, min(e + de, n_words - 1))
+                            s, e = s_new, e_new
                         etype = id2entity_type.get(etype_id, "Unknown")
-                        pred_spans.append((s, e, etype))
+                        pred_spans.append((s, e, etype, conf))
 
                 # Remove overlapping spans: keep highest confidence
                 # (greedy non-overlapping: sort by confidence, skip overlaps)
                 scored = sorted(
-                    [(s, e, t, pred_confs[candidates.index((s, e))]) for (s, e, t) in pred_spans],
+                    pred_spans,
                     key=lambda x: -x[3],
                 )
                 taken = set()
@@ -511,8 +617,17 @@ def main():
     print(f"  neg_sample:     {args.neg_sample_ratio}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    # Pass seed to build_dataloaders for datasets that create dev split at runtime
+    # (CODE-ACCORD, CUAD). Datasets with fixed splits (SciERC, SciER, CoNLL04, ADE)
+    # ignore the seed kwarg. This ensures each seed gets its own train/dev split,
+    # making multi-seed evaluation measure true generalization, not init luck on a
+    # single fixed dev set.
+    import inspect
+    dl_kwargs = dict(batch_size=args.batch_size, max_length=args.max_length)
+    if "seed" in inspect.signature(ds_mod.build_dataloaders).parameters:
+        dl_kwargs["seed"] = args.seed
     train_loader, dev_loader, test_loader = ds_mod.build_dataloaders(
-        tokenizer, batch_size=args.batch_size, max_length=args.max_length,
+        tokenizer, **dl_kwargs,
     )
     print(f"  train: {len(train_loader.dataset)} | dev: {len(dev_loader.dataset)}")
 
@@ -540,6 +655,8 @@ def main():
         use_span_ner=True,
         max_span_width=args.max_span_width,
         bio_enrich=args.bio_enrich,
+        boundary_reg=args.boundary_reg,
+        boundary_refine=args.boundary_refine,
     ).to(device)
 
     # Load ELECTRA cooperative pre-training checkpoint if provided
@@ -637,6 +754,10 @@ def main():
                 label_smoothing=args.label_smoothing,
                 re_focal_gamma=args.re_focal_gamma,
                 re_train_conf=args.re_train_conf,
+                span_proposal=args.span_proposal,
+                span_proposal_expand=args.span_proposal_expand,
+                boundary_reg_weight=args.boundary_reg_weight,
+                eer_alpha=args.eer_alpha,
             )
             gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
                 model, batch, device, ds_mod, entity_type2id,
@@ -649,6 +770,10 @@ def main():
                 label_smoothing=args.label_smoothing,
                 re_focal_gamma=args.re_focal_gamma,
                 re_train_conf=args.re_train_conf,
+                span_proposal=args.span_proposal,
+                span_proposal_expand=args.span_proposal_expand,
+                boundary_reg_weight=args.boundary_reg_weight,
+                eer_alpha=args.eer_alpha,
             )
             # Average the two losses + symmetric KL on BIO logits
             gold_loss = (gold_loss + gold_loss2) / 2
@@ -672,6 +797,10 @@ def main():
                 label_smoothing=args.label_smoothing,
                 re_focal_gamma=args.re_focal_gamma,
                 re_train_conf=args.re_train_conf,
+                span_proposal=args.span_proposal,
+                span_proposal_expand=args.span_proposal_expand,
+                boundary_reg_weight=args.boundary_reg_weight,
+                eer_alpha=args.eer_alpha,
             )
 
         synth_loss_val = 0.0
@@ -686,9 +815,12 @@ def main():
                     cl_entity_only=args.cl_entity_only,
                     bio_weight=bio_w_eff,
                     iou_neg_weight=args.iou_neg_weight,
-                label_smoothing=args.label_smoothing,
-                re_focal_gamma=args.re_focal_gamma,
-                re_train_conf=args.re_train_conf,
+                    label_smoothing=args.label_smoothing,
+                    re_focal_gamma=args.re_focal_gamma,
+                    re_train_conf=args.re_train_conf,
+                    span_proposal=args.span_proposal,
+                    span_proposal_expand=args.span_proposal_expand,
+                    boundary_reg_weight=args.boundary_reg_weight,
                 )
                 synth_loss_val = s_loss.item()
                 total = gold_loss + args.synth_weight * s_loss
@@ -722,6 +854,8 @@ def main():
                 entity_type2id, id2entity_type,
                 max_span_width=args.max_span_width,
                 verbose=True,
+                span_proposal=args.span_proposal,
+                span_proposal_expand=args.span_proposal_expand,
             )
             star = ""
             if metrics["triple_f1"] > best_metrics["triple_f1"]:
@@ -748,6 +882,8 @@ def main():
             model, loader, device, ds_mod,
             entity_type2id, id2entity_type,
             max_span_width=args.max_span_width,
+            span_proposal=args.span_proposal,
+            span_proposal_expand=args.span_proposal_expand,
         )
         if split_name == "dev" and metrics["triple_f1"] > best_metrics["triple_f1"]:
             best_metrics = dict(metrics)
