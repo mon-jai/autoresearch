@@ -132,6 +132,11 @@ def parse_args():
                         "(1 - alpha * entity_density) where entity_density = "
                         "n_gold_entities / n_candidates. Treats unannotated "
                         "tokens as latent variables (Effland & Collins 2021).")
+    p.add_argument("--re-neg-subsample", type=float, default=0.0,
+                   help="RE negative subsampling ratio. 0 = disabled (use all pairs). "
+                        "When >0, keep at most N × (number of positive RE pairs) "
+                        "NO_REL pairs during training. Addresses 92%% NO_REL class "
+                        "imbalance. Recommended: 3.0-5.0.")
     args = p.parse_args()
     # Resolve cycle aliases
     if args.cycle_jsonl_alias and not args.synth_jsonl:
@@ -235,7 +240,8 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                       label_smoothing=0.0, re_focal_gamma=0.0,
                       re_train_conf=0.5,
                       span_proposal=False, span_proposal_expand=1,
-                      boundary_reg_weight=0.0, eer_alpha=0.0):
+                      boundary_reg_weight=0.0, eer_alpha=0.0,
+                      re_neg_subsample=0.0):
     """Compute span NER loss + RE loss + optional BIO auxiliary loss."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -417,6 +423,19 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
             pairs = [(h, t) for h in re_spans for t in re_spans if h != t]
             if pairs:
                 pair_targets = [rel_lookup.get((h, t), NO_REL) for (h, t) in pairs]
+
+                # RE negative subsampling: keep all positive pairs + subsample NO_REL
+                if re_neg_subsample > 0:
+                    pos_idx = [i for i, t in enumerate(pair_targets) if t != NO_REL]
+                    neg_idx = [i for i, t in enumerate(pair_targets) if t == NO_REL]
+                    n_pos_re = len(pos_idx)
+                    if n_pos_re > 0 and len(neg_idx) > int(n_pos_re * re_neg_subsample):
+                        n_neg_keep_re = int(n_pos_re * re_neg_subsample)
+                        neg_sample = random.sample(neg_idx, n_neg_keep_re)
+                        keep_idx = sorted(pos_idx + neg_sample)
+                        pairs = [pairs[i] for i in keep_idx]
+                        pair_targets = [pair_targets[i] for i in keep_idx]
+
                 pair_targets_t = torch.tensor(pair_targets, device=device, dtype=torch.long)
                 re_logits = model.forward_re(hidden[b_idx], word_ids_list[b_idx], pairs)
                 if re_focal_gamma > 0:
@@ -758,6 +777,7 @@ def main():
                 span_proposal_expand=args.span_proposal_expand,
                 boundary_reg_weight=args.boundary_reg_weight,
                 eer_alpha=args.eer_alpha,
+                re_neg_subsample=args.re_neg_subsample,
             )
             gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
                 model, batch, device, ds_mod, entity_type2id,
@@ -774,6 +794,7 @@ def main():
                 span_proposal_expand=args.span_proposal_expand,
                 boundary_reg_weight=args.boundary_reg_weight,
                 eer_alpha=args.eer_alpha,
+                re_neg_subsample=args.re_neg_subsample,
             )
             # Average the two losses + symmetric KL on BIO logits
             gold_loss = (gold_loss + gold_loss2) / 2
@@ -801,6 +822,7 @@ def main():
                 span_proposal_expand=args.span_proposal_expand,
                 boundary_reg_weight=args.boundary_reg_weight,
                 eer_alpha=args.eer_alpha,
+                re_neg_subsample=args.re_neg_subsample,
             )
 
         synth_loss_val = 0.0
