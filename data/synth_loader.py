@@ -15,10 +15,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
-import torch
 from torch.utils.data import Dataset, DataLoader
-
-from data.scierc import BIO_TAG2ID, REL2ID, NO_REL_ID, collate_fn
 
 
 def _find_span_in_words(words, phrase):
@@ -40,11 +37,12 @@ class SynthDataset(Dataset):
     same format as SciERCSentenceDataset.__getitem__().
     """
     def __init__(self, jsonl_path, tokenizer, max_length: int = 128,
-                 entity_type: str = "Method",
+                 ds_mod=None, entity_type: str = None,
                  min_containment: float = 0.0):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.entity_type = entity_type
+        self.ds_mod = ds_mod
+        self.entity_type = entity_type or ds_mod.ENTITY_TYPES[0]
         self.examples = []
 
         with open(jsonl_path) as f:
@@ -61,12 +59,12 @@ class SynthDataset(Dataset):
                     continue
                 rel_id = rec.get("rel_id")
                 if rel_id is None:
-                    rel_id = REL2ID.get(rec["rel"], NO_REL_ID)
-                if rel_id == NO_REL_ID:
+                    rel_id = ds_mod.REL2ID.get(rec["rel"], ds_mod.NO_REL_ID)
+                if rel_id == ds_mod.NO_REL_ID:
                     continue
                 # Use the source entity type from the jsonl if available;
                 # fall back to the constructor default (Fix 1 for stage2-010).
-                h_type = rec.get("entity_type", entity_type)
+                h_type = rec.get("entity_type", self.entity_type)
                 # Tail type isn't stored separately; use head type as proxy
                 # (SciERC triples often share the same type for both spans).
                 t_type = rec.get("tail_entity_type", h_type)
@@ -97,8 +95,7 @@ class SynthDataset(Dataset):
         word_ids = encoding.word_ids()
 
         # BIO labels from ner spans
-        from data.scierc import _bio_tags_for_sentence
-        word_bio = _bio_tags_for_sentence(len(words), ex["ner"])
+        word_bio = self.ds_mod._bio_tags_for_sentence(len(words), ex["ner"])
         token_labels = []
         prev_word_id = None
         for wid in word_ids:
@@ -124,12 +121,14 @@ class SynthDataset(Dataset):
 
 def build_synth_loader(tokenizer, jsonl_path, batch_size: int = 16,
                        max_length: int = 128, num_workers: int = 0,
-                       min_containment: float = 0.0):
-    ds = SynthDataset(jsonl_path, tokenizer, max_length,
+                       min_containment: float = 0.0, ds_mod=None):
+    if ds_mod is None:
+        from data import scierc as ds_mod
+    ds = SynthDataset(jsonl_path, tokenizer, max_length, ds_mod=ds_mod,
                       min_containment=min_containment)
     pad_id = tokenizer.pad_token_id or 0
     loader = DataLoader(
         ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-        collate_fn=lambda b: collate_fn(b, pad_token_id=pad_id),
+        collate_fn=lambda b: ds_mod.collate_fn(b, pad_token_id=pad_id),
     )
     return loader

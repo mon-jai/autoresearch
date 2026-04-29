@@ -15,6 +15,7 @@ Usage:
 """
 import argparse
 import importlib
+import json
 import random
 import sys
 import time
@@ -62,6 +63,11 @@ def parse_args():
     p.add_argument("--synth-jsonl", default="",
                    help="Path to synth/cycle JSONL. Empty = gold only. "
                         "Used for both CAST pseudo-labels and CycleGT round-trip data.")
+    p.add_argument("--relation-replay", action="store_true",
+                   help="Build a synth loader from positive train relations in the "
+                        "current process's train split. This avoids dev leakage from "
+                        "separately generated replay JSONL files.")
+    p.add_argument("--relation-replay-copies", type=int, default=1)
     p.add_argument("--cycle-jsonl", default="", dest="cycle_jsonl_alias",
                    help="Alias for --synth-jsonl (CycleGT round-trip data).")
     p.add_argument("--synth-weight", type=float, default=0.3)
@@ -144,6 +150,37 @@ def parse_args():
     if args.cycle_weight is not None:
         args.synth_weight = args.cycle_weight
     return args
+
+
+def _write_relation_replay_jsonl(train_dataset, ds_mod, out_path, copies=1):
+    """Write focused relation examples from the already-created train split."""
+    records = []
+    for ex in train_dataset.examples:
+        words = ex["words"]
+        type_by_span = {(s, e): t for (s, e, t) in ex["ner"]}
+        for h_span, t_span, rel_id in ex["relations"]:
+            if rel_id == ds_mod.NO_REL_ID:
+                continue
+            hs, he = h_span
+            ts, te = t_span
+            records.append({
+                "synth_sentence": " ".join(words),
+                "head": " ".join(words[hs:he + 1]),
+                "tail": " ".join(words[ts:te + 1]),
+                "rel": ds_mod.ID2REL[int(rel_id)],
+                "rel_id": int(rel_id),
+                "entity_type": type_by_span.get(h_span, ds_mod.ENTITY_TYPES[0]),
+                "tail_entity_type": type_by_span.get(t_span, ds_mod.ENTITY_TYPES[0]),
+                "containment": 1.0,
+                "source_sentence": " ".join(words),
+            })
+    records = records * max(copies, 1)
+    random.shuffle(records)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w") as fout:
+        for rec in records:
+            fout.write(json.dumps(rec) + "\n")
+    return len(records)
 
 
 def focal_loss(logits, targets, gamma=2.0, weights=None, label_smoothing=0.0):
@@ -716,6 +753,15 @@ def main():
         optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=args.max_steps,
     )
 
+    if args.relation_replay:
+        replay_path = Path(f"/tmp/{args.dataset}_relation_replay_s{args.seed}.jsonl")
+        n_replay = _write_relation_replay_jsonl(
+            train_loader.dataset, ds_mod, replay_path,
+            copies=args.relation_replay_copies,
+        )
+        args.synth_jsonl = str(replay_path)
+        print(f"  relation_replay: {n_replay} examples -> {args.synth_jsonl}")
+
     use_synth = bool(args.synth_jsonl)
     synth_loader = None
     if use_synth:
@@ -723,6 +769,7 @@ def main():
         synth_loader = build_synth_loader(
             tokenizer, args.synth_jsonl,
             batch_size=args.batch_size, max_length=args.max_length,
+            ds_mod=ds_mod,
         )
         print(f"  synth: {len(synth_loader.dataset)}")
 
