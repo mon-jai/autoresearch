@@ -113,6 +113,38 @@ loss/head changes: merge the existing schema-aware examples with the targeted
 low-recall augmentation set, then run a small 2-seed DeBERTa-large probe before
 committing to another 8-seed validation.
 
+### 5. Combined schema-aware + low-recall augmentation 2-seed probe
+
+Merged `results/accord_llm_aug_schema_filtered_s42.jsonl` with
+`results/accord_llm_aug_targeted_lowrecall_s43.jsonl`, deduplicated by JSON row,
+and produced `results/accord_llm_aug_combined_schema_lowrecall_20260504.jsonl`.
+The training loader accepted 145 effective synthetic examples.
+
+Relation coverage in the combined file:
+
+| Relation | Rows |
+|----------|------|
+| equal | 52 |
+| greater-equal | 51 |
+| necessity | 20 |
+| part-of | 52 |
+| selection | 24 |
+
+Ran a 2-seed DeBERTa-large probe with `synth_weight=0.3`,
+`gold_only_steps=500`, seeds 43 and 44.
+
+| Seed | Schema-only LLM aug | Combined LLM aug | Delta | Test Triple |
+|------|---------------------|------------------|-------|-------------|
+| 43 | 0.3849 | 0.3919 | +0.0070 | 0.1227 |
+| 44 | 0.4086 | 0.4037 | -0.0049 | 0.1410 |
+| **Mean** | **0.3968** | **0.3978 +/- 0.0083** | **+0.0010** | **0.1318 +/- 0.0129** |
+
+Conclusion: combined augmentation is mixed and does not justify an immediate
+8-seed escalation. The extra targeted low-recall rows add coverage, but at
+`synth_weight=0.3` they do not clearly beat the cleaner 84-example schema-aware
+set. Best ROI is to test whether the combined file is useful at lower synthetic
+pressure (`synth_weight=0.1`) before generating or adding more examples.
+
 ## [Phase 1] LLM Wiki 基礎設施與文獻技能整合
 *(最後更新：2026-04-08)*
 
