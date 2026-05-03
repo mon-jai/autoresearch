@@ -145,6 +145,23 @@ Conclusion: combined augmentation is mixed and does not justify an immediate
 set. Best ROI is to test whether the combined file is useful at lower synthetic
 pressure (`synth_weight=0.1`) before generating or adding more examples.
 
+### 6. Combined augmentation lower-weight probe
+
+Ran the same combined synthetic file with `synth_weight=0.1` on seeds 43 and
+44.
+
+| Seed | Schema-only aug | Combined w0.3 | Combined w0.1 | Test Triple |
+|------|-----------------|---------------|---------------|-------------|
+| 43 | 0.3849 | 0.3919 | 0.3967 | 0.1404 |
+| 44 | 0.4086 | 0.4037 | 0.3967 | 0.1366 |
+| **Mean** | **0.3968** | **0.3978** | **0.3967 +/- 0.0000** | **0.1385 +/- 0.0027** |
+
+Conclusion: lowering synthetic weight helps seed 43 but hurts seed 44. The
+expanded synthetic set remains a mixed signal, not a robust improvement over
+the cleaner 84-example schema-aware set. Next data-centric ROI is stricter
+selection/filtering of synthetic examples, not adding more rows or escalating
+this combined set to 8 seeds.
+
 ## [Phase 1] LLM Wiki 基礎設施與文獻技能整合
 *(最後更新：2026-04-08)*
 
