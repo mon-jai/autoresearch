@@ -176,9 +176,9 @@ class BertKGExtractor(nn.Module):
         # ── Pluggable adapters ─────────────────────────────────────────
         self.adapters = nn.ModuleDict()
         # Register the TextAdapter by default — Stage 2 only needs text.
-        # Shares the BERT body's word_embeddings parameters so the forward
-        # path is mathematically identical to bert(input_ids=...).
-        self.register_adapter("text", TextAdapter(self.backbone.bert.embeddings.word_embeddings))
+        # Shares the backbone's input embedding parameters so the forward path
+        # works across BERT, RoBERTa/XLM-R, DeBERTa, and other AutoModel classes.
+        self.register_adapter("text", TextAdapter(self.backbone.bert.get_input_embeddings()))
 
     # ── Adapter registration API ────────────────────────────────────────
 

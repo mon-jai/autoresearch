@@ -143,6 +143,12 @@ def parse_args():
                         "When >0, keep at most N × (number of positive RE pairs) "
                         "NO_REL pairs during training. Addresses 92%% NO_REL class "
                         "imbalance. Recommended: 3.0-5.0.")
+    p.add_argument("--doc-window-size", type=int, default=1,
+                   help="For document-aware datasets, join N consecutive sentences "
+                        "from the same source document into one context window. "
+                        "1 keeps sentence-level training.")
+    p.add_argument("--doc-window-stride", type=int, default=1,
+                   help="Stride for --doc-window-size sliding windows.")
     args = p.parse_args()
     # Resolve cycle aliases
     if args.cycle_jsonl_alias and not args.synth_jsonl:
@@ -680,8 +686,13 @@ def main():
     # single fixed dev set.
     import inspect
     dl_kwargs = dict(batch_size=args.batch_size, max_length=args.max_length)
-    if "seed" in inspect.signature(ds_mod.build_dataloaders).parameters:
+    dl_params = inspect.signature(ds_mod.build_dataloaders).parameters
+    if "seed" in dl_params:
         dl_kwargs["seed"] = args.seed
+    if "doc_window_size" in dl_params:
+        dl_kwargs["doc_window_size"] = args.doc_window_size
+    if "doc_window_stride" in dl_params:
+        dl_kwargs["doc_window_stride"] = args.doc_window_stride
     train_loader, dev_loader, test_loader = ds_mod.build_dataloaders(
         tokenizer, **dl_kwargs,
     )

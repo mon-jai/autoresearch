@@ -8,6 +8,7 @@ Relations CSV: entity-pair-marked sentences (one row per pair).
 Format compatible with SciERC pipeline (same collate_fn, same batch structure).
 """
 import csv
+import ast
 import json
 import re
 import random
@@ -34,6 +35,15 @@ NO_REL_ID = 0
 REL2ID = {"NO_REL": NO_REL_ID, **{r: i + 1 for i, r in enumerate(RELATION_TYPES)}}
 ID2REL = {i: r for r, i in REL2ID.items()}
 NUM_RELATIONS = len(REL2ID)  # 10
+
+
+def _doc_id_from_metadata(raw: str) -> str:
+    """Extract source document ID from CODE-ACCORD metadata."""
+    try:
+        meta = ast.literal_eval(raw) if raw else {}
+    except (SyntaxError, ValueError):
+        meta = {}
+    return str(meta.get("ID", "UNKNOWN"))
 
 
 def _bio_tags_for_sentence(num_words: int, ner_spans: list) -> list:
@@ -112,14 +122,19 @@ def _load_entities(csv_path: str) -> dict:
     result = {}
     with open(csv_path) as f:
         reader = csv.DictReader(f)
-        for row in reader:
+        for seq, row in enumerate(reader):
             eid = row["example_id"]
             words = row["processed_content"].split()
             bio_tags = row["label"].split()
             if len(bio_tags) != len(words):
                 continue  # skip malformed
             spans = _bio_to_spans(bio_tags)
-            result[eid] = {"words": words, "ner": spans}
+            result[eid] = {
+                "words": words,
+                "ner": spans,
+                "doc_id": _doc_id_from_metadata(row.get("metadata", "")),
+                "seq": seq,
+            }
     return result
 
 
@@ -128,7 +143,7 @@ def _load_relations(csv_path: str, entity_data: dict) -> dict:
     result = {}
     with open(csv_path) as f:
         reader = csv.DictReader(f)
-        for row in reader:
+        for seq, row in enumerate(reader):
             eid = row["example_id"]
             rel_type = row["relation_type"]
             if rel_type == "none":
@@ -160,11 +175,66 @@ def _load_relations(csv_path: str, entity_data: dict) -> dict:
                 continue
 
             if eid not in result:
-                result[eid] = {"words": words, "relations": []}
+                result[eid] = {
+                    "words": words,
+                    "relations": [],
+                    "doc_id": _doc_id_from_metadata(row.get("metadata", "")),
+                    "seq": seq,
+                }
             result[eid]["relations"].append(
                 (e1_span, e2_span, REL2ID[rel_type])
             )
     return result
+
+
+def _make_doc_windows(examples: list, window_size: int = 1, stride: int = 1) -> list:
+    """Combine consecutive sentences from the same source document.
+
+    Entity and relation spans remain word-indexed, shifted by each sentence's
+    offset inside the joined context. Relations are still sentence-local because
+    CODE-ACCORD does not annotate cross-sentence relation pairs.
+    """
+    if window_size <= 1:
+        return examples
+
+    stride = max(stride, 1)
+    by_doc = {}
+    for ex in examples:
+        by_doc.setdefault(ex.get("doc_id", "UNKNOWN"), []).append(ex)
+
+    windows = []
+    for doc_id, doc_examples in by_doc.items():
+        doc_examples = sorted(doc_examples, key=lambda ex: ex.get("seq", 0))
+        if not doc_examples:
+            continue
+        for start in range(0, len(doc_examples), stride):
+            chunk = doc_examples[start:start + window_size]
+            if not chunk:
+                continue
+
+            words = []
+            ner = []
+            relations = []
+            offset = 0
+            eids = []
+            for sent in chunk:
+                eids.append(sent.get("example_id", ""))
+                words.extend(sent["words"])
+                ner.extend((s + offset, e + offset, t) for s, e, t in sent["ner"])
+                relations.extend(
+                    ((hs + offset, he + offset), (ts + offset, te + offset), rid)
+                    for (hs, he), (ts, te), rid in sent["relations"]
+                )
+                offset += len(sent["words"])
+
+            windows.append({
+                "example_id": "|".join(eids),
+                "doc_id": doc_id,
+                "words": words,
+                "ner": ner,
+                "relations": relations,
+            })
+    return windows
 
 
 class CodeAccordDataset(Dataset):
@@ -261,7 +331,8 @@ DEFAULT_DATA_DIR = Path(__file__).parent / "code_accord"
 
 def build_dataloaders(tokenizer, data_dir=None, batch_size: int = 16,
                       max_length: int = 128, num_workers: int = 0,
-                      dev_ratio: float = 0.15, seed: int = 42):
+                      dev_ratio: float = 0.15, seed: int = 42,
+                      doc_window_size: int = 1, doc_window_stride: int = 1):
     data_dir = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
     pad_id = tokenizer.pad_token_id
 
@@ -279,16 +350,20 @@ def build_dataloaders(tokenizer, data_dir=None, batch_size: int = 16,
         """
         examples = []
         if require_entities:
-            all_ids = set(ent_data.keys())  # only entity-annotated sentences
+            all_ids = list(ent_data.keys())  # only entity-annotated sentences
         else:
-            all_ids = set(ent_data.keys()) | set(rel_data.keys())
+            all_ids = list(ent_data.keys()) + [
+                eid for eid in rel_data.keys() if eid not in ent_data
+            ]
         for eid in all_ids:
             if eid in ent_data:
                 words = ent_data[eid]["words"]
                 ner = ent_data[eid]["ner"]
+                doc_id = ent_data[eid].get("doc_id", "UNKNOWN")
             elif eid in rel_data:
                 words = rel_data[eid]["words"]
                 ner = []
+                doc_id = rel_data[eid].get("doc_id", "UNKNOWN")
             else:
                 continue
 
@@ -298,6 +373,9 @@ def build_dataloaders(tokenizer, data_dir=None, batch_size: int = 16,
                 relations = []
 
             examples.append({
+                "example_id": eid,
+                "doc_id": doc_id,
+                "seq": ent_data.get(eid, rel_data.get(eid, {})).get("seq", 0),
                 "words": words,
                 "ner": ner,
                 "relations": relations,
@@ -314,7 +392,13 @@ def build_dataloaders(tokenizer, data_dir=None, batch_size: int = 16,
     dev_examples = train_examples[:n_dev]
     train_examples = train_examples[n_dev:]
 
+    train_examples = _make_doc_windows(train_examples, doc_window_size, doc_window_stride)
+    dev_examples = _make_doc_windows(dev_examples, doc_window_size, doc_window_stride)
+    test_examples = _make_doc_windows(test_examples, doc_window_size, doc_window_stride)
+
     print(f"  CODE-ACCORD: train={len(train_examples)} dev={len(dev_examples)} test={len(test_examples)}")
+    if doc_window_size > 1:
+        print(f"  Doc windows: size={doc_window_size} stride={doc_window_stride}")
     print(f"  Train rels: {sum(len(e['relations']) for e in train_examples)}")
     print(f"  Dev rels:   {sum(len(e['relations']) for e in dev_examples)}")
 
