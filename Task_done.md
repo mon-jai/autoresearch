@@ -71,6 +71,48 @@ That is the only recent probe with a large single-seed gain (+0.0778 on
 DeBERTa-large seed 47) and directly targets the confirmed data-volume/coverage
 bottleneck.
 
+### 4. Schema-aware Qwen LLM augmentation 8-seed validation
+
+Completed the missing DeBERTa-large LLM-augmentation seeds 43 and 44, then
+aggregated with the already-completed seeds 42, 45, 46, 47, 48, and 49. All
+runs used the schema-aware synthetic file
+`results/accord_llm_aug_schema_filtered_s42.jsonl` (84 effective synth-loader
+examples), `synth_weight=0.3`, `gold_only_steps=500`, `bio_weight=0.1`, and
+`neg_sample_ratio=3.0`.
+
+Spark note: DeBERTa-large on the GB10 now needs `PYTORCH_JIT=0`; otherwise
+TorchScript/NVRTC fails on DeBERTa relative-position code with
+`invalid value for --gpu-architecture`.
+
+| Seed | Plain DeBERTa-large | LLM aug | Delta |
+|------|---------------------|---------|-------|
+| 42 | 0.4288 | 0.4168 | -0.0120 |
+| 43 | 0.3798 | 0.3849 | +0.0051 |
+| 44 | 0.3780 | 0.4086 | +0.0306 |
+| 45 | 0.4150 | 0.3706 | -0.0444 |
+| 46 | 0.3697 | 0.3604 | -0.0093 |
+| 47 | 0.3121 | 0.3899 | +0.0778 |
+| 48 | 0.3738 | 0.3697 | -0.0041 |
+| 49 | 0.3805 | 0.4087 | +0.0282 |
+| **Mean** | **0.3797 +/- 0.0346** | **0.3887 +/- 0.0210** | **+0.0090** |
+
+Conclusion: augmentation improves the mean and reduces variance, but the paired
+effect is mixed across seeds and not statistically clear. The large seed47 gain
+was partly a low-baseline recovery, not a universal augmentation effect. Keep
+this as the current best mean/stability signal, but do not lock it as a
+breakthrough.
+
+Knowledge Pipeline trigger: document-windowing was neutral and schema-aware LLM
+augmentation was only marginal. Ran `/research-lookup` for synthetic-data
+quality/diversity selection; saved results to
+`sources/papers_20260504_llm_synth_quality_diversity_low_resource_re.md` and
+summarized them in `wiki/raw/LLM_synth_quality_diversity_low_resource_RE_20260504.md`.
+
+Next ROI: try ODDA/S2ynRE-inspired data-centric augmentation rather than more
+loss/head changes: merge the existing schema-aware examples with the targeted
+low-recall augmentation set, then run a small 2-seed DeBERTa-large probe before
+committing to another 8-seed validation.
+
 ## [Phase 1] LLM Wiki 基礎設施與文獻技能整合
 *(最後更新：2026-04-08)*
 
