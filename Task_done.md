@@ -46,9 +46,30 @@ Smoke tests:
 - Training dry-run passed: 3-step BERT run with `--doc-window-size 3`
   completed train/dev/test metric calculation without breaking.
 
-Next ROI: after morning review, run a real 4-seed document-window comparison
-against sentence-level BERT/XLM-R. Use `max_length=256` to avoid truncating the
-joined context.
+### 3. A8 BERT document-window 4-seed comparison
+
+Ran the real CODE-ACCORD comparison with `bert-base-uncased`,
+`doc_window_size=3`, `doc_window_stride=1`, `max_length=256`, seeds 42-45, and
+corrected per-seed dev splits.
+
+| Seed | Best step | Dev NER | Dev Triple | Test Triple |
+|------|-----------|---------|------------|-------------|
+| 42 | 3300 | 0.5491 | 0.3177 | 0.0894 |
+| 43 | 2100 | 0.6049 | 0.3281 | 0.1205 |
+| 44 | 2000 | 0.6243 | 0.3411 | 0.1325 |
+| 45 | 3200 | 0.5767 | 0.3267 | 0.0633 |
+| **Mean** | - | - | **0.3284 +/- 0.0096** | **0.1014 +/- 0.0312** |
+
+Conclusion: document-window BERT is effectively tied with the sentence-level
+BERT-base 8-seed baseline (`0.329 +/- 0.028`). The lower variance is useful
+stability evidence, but there is no mean Triple gain. Keep A8 as functional
+infrastructure for Phase B/cross-document work; do not treat it as an ACCORD
+quality breakthrough.
+
+Next ROI: validate the schema-aware Qwen LLM augmentation signal across 4 seeds.
+That is the only recent probe with a large single-seed gain (+0.0778 on
+DeBERTa-large seed 47) and directly targets the confirmed data-volume/coverage
+bottleneck.
 
 ## [Phase 1] LLM Wiki 基礎設施與文獻技能整合
 *(最後更新：2026-04-08)*
