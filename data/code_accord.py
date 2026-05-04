@@ -188,11 +188,13 @@ def _load_relations(csv_path: str, entity_data: dict) -> dict:
 
 
 def _make_doc_windows(examples: list, window_size: int = 1, stride: int = 1) -> list:
-    """Combine consecutive sentences from the same source document.
+    """Build sliding document windows from consecutive same-document sentences.
 
-    Entity and relation spans remain word-indexed, shifted by each sentence's
-    offset inside the joined context. Relations are still sentence-local because
-    CODE-ACCORD does not annotate cross-sentence relation pairs.
+    Phase A8 uses ``window_size=2`` so each training sample is the current
+    sentence plus the next sentence. Entity and relation spans remain
+    word-indexed, shifted by each sentence's offset inside the joined context.
+    Relations stay sentence-local because CODE-ACCORD does not annotate
+    cross-sentence relation pairs.
     """
     if window_size <= 1:
         return examples
