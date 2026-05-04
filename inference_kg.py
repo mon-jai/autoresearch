@@ -26,6 +26,7 @@ Usage:
     uv run python inference_kg.py --checkpoint checkpoints/best.pt --input raw_text.jsonl
 """
 import argparse
+import inspect
 import importlib
 import json
 from pathlib import Path
@@ -51,9 +52,18 @@ def parse_args():
     p.add_argument("--dataset", default="scierc", choices=list(DATASET_REGISTRY.keys()))
     p.add_argument("--split", default="test", choices=["train", "dev", "test"])
     p.add_argument("--model-name", default=None)
+    p.add_argument("--max-length", type=int, default=128)
     p.add_argument("--max-span-width", type=int, default=8)
     p.add_argument("--span-threshold", type=float, default=0.0,
                    help="Minimum NER confidence to keep a span. 0 = keep all predicted entities.")
+    p.add_argument("--use-gold-entities", action="store_true",
+                   help="Oracle diagnostic: run relation inference over gold entity spans instead of predicted spans.")
+    p.add_argument("--seed", type=int, default=42,
+                   help="Seed for datasets with runtime train/dev splits.")
+    p.add_argument("--doc-window-size", type=int, default=1,
+                   help="For document-aware datasets, join N consecutive sentences before extraction.")
+    p.add_argument("--doc-window-stride", type=int, default=1,
+                   help="Stride for --doc-window-size sliding windows.")
     p.add_argument("--out-jsonl", default="results/kg_inference.jsonl")
     p.add_argument("--device", default=None)
     return p.parse_args()
@@ -74,10 +84,18 @@ def main():
         }.get(args.dataset, "bert-base-uncased")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    _, dev_loader, test_loader = ds_mod.build_dataloaders(
-        tokenizer, batch_size=1, max_length=128,
+    dl_kwargs = dict(batch_size=1, max_length=args.max_length)
+    dl_params = inspect.signature(ds_mod.build_dataloaders).parameters
+    if "seed" in dl_params:
+        dl_kwargs["seed"] = args.seed
+    if "doc_window_size" in dl_params:
+        dl_kwargs["doc_window_size"] = args.doc_window_size
+    if "doc_window_stride" in dl_params:
+        dl_kwargs["doc_window_stride"] = args.doc_window_stride
+    train_loader, dev_loader, test_loader = ds_mod.build_dataloaders(
+        tokenizer, **dl_kwargs,
     )
-    loader = {"dev": dev_loader, "test": test_loader}.get(args.split, test_loader)
+    loader = {"train": train_loader, "dev": dev_loader, "test": test_loader}[args.split]
 
     # Load model
     model = BertKGExtractor(
@@ -120,6 +138,8 @@ def main():
             words_list = batch.get("words", [None])
             gold_entities_list = batch.get("gold_entities", [None])
             gold_relations_list = batch.get("gold_relations", [None])
+            doc_ids = batch.get("doc_ids", [None])
+            example_ids = batch.get("example_ids", [None])
 
             with torch.no_grad():
                 hidden = model.encode(
@@ -129,6 +149,8 @@ def main():
             for b_idx in range(input_ids.size(0)):
                 n_words = num_words_list[b_idx]
                 words = words_list[b_idx] if words_list[b_idx] is not None else []
+                source_doc_id = doc_ids[b_idx] if doc_ids[b_idx] else doc_id
+                source_example_id = example_ids[b_idx] if example_ids[b_idx] else str(doc_id)
 
                 with torch.no_grad():
                     span_logits, candidates = model.forward_span_ner(
@@ -165,6 +187,17 @@ def main():
                         filtered_entities.append(ent)
                         taken.add((s, e))
                 pred_entities = filtered_entities
+
+                gold_ents = gold_entities_list[b_idx] if gold_entities_list[b_idx] is not None else []
+                if args.use_gold_entities and gold_ents:
+                    pred_entities = [
+                        {
+                            "span": [s, e],
+                            "type": t,
+                            "confidence": 1.0,
+                        }
+                        for (s, e, t) in gold_ents
+                    ]
 
                 # RE predictions with confidence
                 pred_triples = []
@@ -210,7 +243,6 @@ def main():
                             })
 
                 # Gold data (if available)
-                gold_ents = gold_entities_list[b_idx] if gold_entities_list[b_idx] is not None else []
                 gold_rels = gold_relations_list[b_idx] if gold_relations_list[b_idx] is not None else []
 
                 gold_ents_out = [
@@ -232,7 +264,8 @@ def main():
                     })
 
                 record = {
-                    "doc_id": doc_id,
+                    "doc_id": source_doc_id,
+                    "example_id": source_example_id,
                     "words": words,
                     "sentence": " ".join(words) if words else "",
                     "predicted_entities": pred_entities,

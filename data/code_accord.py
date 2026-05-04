@@ -288,6 +288,8 @@ class CodeAccordDataset(Dataset):
             "gold_relations": ex["relations"],
             "num_words": len(words),
             "words": words,
+            "doc_id": ex.get("doc_id", ""),
+            "example_id": ex.get("example_id", ""),
         }
 
 
@@ -304,6 +306,8 @@ def collate_fn(batch, pad_token_id: int = 0):
     gold_relations_list = []
     num_words_list = []
     words_list = []
+    doc_id_list = []
+    example_id_list = []
 
     for i, b in enumerate(batch):
         L = len(b["input_ids"])
@@ -315,6 +319,8 @@ def collate_fn(batch, pad_token_id: int = 0):
         gold_relations_list.append(b["gold_relations"])
         num_words_list.append(b["num_words"])
         words_list.append(b["words"])
+        doc_id_list.append(b.get("doc_id", ""))
+        example_id_list.append(b.get("example_id", ""))
 
     return {
         "input_ids": input_ids,
@@ -325,6 +331,8 @@ def collate_fn(batch, pad_token_id: int = 0):
         "gold_relations": gold_relations_list,
         "num_words": num_words_list,
         "words": words_list,
+        "doc_ids": doc_id_list,
+        "example_ids": example_id_list,
     }
 
 
