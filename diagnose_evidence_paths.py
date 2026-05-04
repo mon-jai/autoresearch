@@ -113,6 +113,13 @@ def main():
     relation_hits = 0
     source_hits = 0
     examples = []
+    by_relation = defaultdict(lambda: {
+        "n": 0,
+        "head_hits": 0,
+        "tail_hits": 0,
+        "relation_hits": 0,
+        "source_hits": 0,
+    })
 
     for rec in records:
         for gold in rec.get("gold_triples", []):
@@ -141,6 +148,12 @@ def main():
             tail_hits += int(tail_hit)
             relation_hits += int(rel_hit)
             source_hits += int(src_hit)
+            rel_stats = by_relation[gold["relation"]]
+            rel_stats["n"] += 1
+            rel_stats["head_hits"] += int(bool(starts))
+            rel_stats["tail_hits"] += int(tail_hit)
+            rel_stats["relation_hits"] += int(rel_hit)
+            rel_stats["source_hits"] += int(src_hit)
 
             if len(examples) < 12:
                 examples.append({
@@ -167,6 +180,16 @@ def main():
         "tail_reachable_topk": tail_hits / max(total, 1),
         "relation_present_topk": relation_hits / max(total, 1),
         "source_tail_present_topk": source_hits / max(total, 1),
+        "by_relation": {
+            rel: {
+                "n": stats["n"],
+                "head_node_recall": stats["head_hits"] / max(stats["n"], 1),
+                "tail_reachable_topk": stats["tail_hits"] / max(stats["n"], 1),
+                "relation_present_topk": stats["relation_hits"] / max(stats["n"], 1),
+                "source_tail_present_topk": stats["source_hits"] / max(stats["n"], 1),
+            }
+            for rel, stats in sorted(by_relation.items())
+        },
         "examples": examples,
     }
 
@@ -180,6 +203,14 @@ def main():
     print(f"  Tail reachable top-{args.top_k}: {summary['tail_reachable_topk']:.3f}")
     print(f"  Relation present top-{args.top_k}: {summary['relation_present_topk']:.3f}")
     print(f"  Source tail top-{args.top_k}:     {summary['source_tail_present_topk']:.3f}")
+    print("  By relation:")
+    for rel, stats in summary["by_relation"].items():
+        print(
+            f"    {rel:14s} n={stats['n']:3d} "
+            f"head={stats['head_node_recall']:.3f} "
+            f"tail={stats['tail_reachable_topk']:.3f} "
+            f"rel={stats['relation_present_topk']:.3f}"
+        )
     print(f"  Output: {out_path}")
 
 
