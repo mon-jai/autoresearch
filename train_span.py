@@ -159,6 +159,12 @@ def parse_args():
                         "relations) and have 0%% evidence-path reachability. "
                         "Value >1.0 upweights these classes in the RE cross-entropy. "
                         "Recommended: 3.0-8.0. Default 1.0 (no boost).")
+    p.add_argument("--re-context-span", action="store_true",
+                   help="A12: Add mean of tokens between head and tail spans as a third "
+                        "feature vector in the RE pair representation (3H instead of 2H). "
+                        "Captures in-span evidence text directly. Works for same-sentence "
+                        "pairs; returns zero vector for adjacent/overlapping spans. "
+                        "Note: requires re-initializing re_head with 3H input.")
     p.add_argument("--doc-window-size", type=int, default=1,
                    help="For document-aware datasets, join N consecutive sentences "
                         "from the same source document into one context window. "
@@ -768,6 +774,20 @@ def main():
         boundary_reg=args.boundary_reg,
         boundary_refine=args.boundary_refine,
     ).to(device)
+
+    # A12: Context-between-spans RE enrichment.
+    # When enabled, rebuild re_head with 3H input (head; tail; between-span mean).
+    if args.re_context_span:
+        model.re_context_span = True
+        hidden = model.backbone.hidden_size
+        n_rel = ds_mod.NUM_RELATIONS
+        model.re_head = torch.nn.Sequential(
+            torch.nn.Linear(hidden * 3, hidden),
+            torch.nn.GELU(),
+            torch.nn.Dropout(0.1),
+            torch.nn.Linear(hidden, n_rel),
+        ).to(device)
+        print(f"  re_context_span: enabled (RE head input: 3H={hidden*3})")
 
     # Load ELECTRA cooperative pre-training checkpoint if provided
     if args.pretrain_ckpt:

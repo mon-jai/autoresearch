@@ -166,12 +166,19 @@ class BertKGExtractor(nn.Module):
             self.boundary_refine_norm = nn.LayerNorm(span_in_dim)
 
         # RE head — 2H concat + 2-layer MLP.
+        # Optional 3H: if re_context_span=True, adds mean of tokens between the
+        # head and tail spans as a third feature vector (inter-span context).
+        self.re_context_span = False  # set via train_span.py --re-context-span
+        re_in_dim = hidden * 2  # default; updated to 3H if re_context_span is set
         self.re_head = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
+            nn.Linear(re_in_dim, hidden),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, n_rel),
         )
+        self._re_hidden = hidden
+        self._re_n_rel = n_rel
+        self._dropout_p = dropout
 
         # ── Pluggable adapters ─────────────────────────────────────────
         self.adapters = nn.ModuleDict()
@@ -438,6 +445,20 @@ class BertKGExtractor(nn.Module):
             return hidden_states.new_zeros(hidden_states.size(-1))
         return hidden_states[token_idx].max(dim=0).values
 
+    def _between_span_repr(self, hidden_states_b: torch.Tensor, word_ids_b: list,
+                            span_a: tuple, span_b: tuple) -> torch.Tensor:
+        """Mean-pool tokens strictly between two spans (exclusive of span endpoints).
+        Returns (H,). Returns zero vector if spans are adjacent or overlapping.
+        """
+        lo = min(span_a[1], span_b[1]) + 1  # word after earlier span end
+        hi = max(span_a[0], span_b[0]) - 1  # word before later span start
+        if lo > hi:
+            return hidden_states_b.new_zeros(hidden_states_b.size(-1))
+        token_idx = [i for i, wid in enumerate(word_ids_b) if wid is not None and lo <= wid <= hi]
+        if not token_idx:
+            return hidden_states_b.new_zeros(hidden_states_b.size(-1))
+        return hidden_states_b[token_idx].mean(dim=0)
+
     def forward_re(self, hidden_states_b: torch.Tensor, word_ids_b: list, pairs: list) -> torch.Tensor:
         """
         For one example in the batch:
@@ -445,6 +466,9 @@ class BertKGExtractor(nn.Module):
             word_ids_b:      list[int|None] length T
             pairs:           list of ((hs, he), (ts, te))
         Returns: (num_pairs, NUM_RELATIONS)
+
+        If self.re_context_span is True, the pair representation is 3H:
+        [head_vec; tail_vec; between_span_mean] instead of 2H [head_vec; tail_vec].
         """
         if not pairs:
             return hidden_states_b.new_zeros((0, NUM_RELATIONS))
@@ -452,8 +476,13 @@ class BertKGExtractor(nn.Module):
         for (hs, he), (ts, te) in pairs:
             head_vec = self.span_repr(hidden_states_b, word_ids_b, (hs, he))
             tail_vec = self.span_repr(hidden_states_b, word_ids_b, (ts, te))
-            feats.append(torch.cat([head_vec, tail_vec], dim=-1))
-        feats = torch.stack(feats, dim=0)  # (num_pairs, 2H)
+            if self.re_context_span:
+                ctx_vec = self._between_span_repr(
+                    hidden_states_b, word_ids_b, (hs, he), (ts, te))
+                feats.append(torch.cat([head_vec, tail_vec, ctx_vec], dim=-1))
+            else:
+                feats.append(torch.cat([head_vec, tail_vec], dim=-1))
+        feats = torch.stack(feats, dim=0)  # (num_pairs, 2H or 3H)
         return self.re_head(self.dropout(feats))
 
 
