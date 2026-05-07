@@ -143,6 +143,15 @@ def parse_args():
                         "When >0, keep at most N × (number of positive RE pairs) "
                         "NO_REL pairs during training. Addresses 92%% NO_REL class "
                         "imbalance. Recommended: 3.0-5.0.")
+    p.add_argument("--re-adv-neg", action="store_true",
+                   help="Self-adversarial negative sampling for RE (RotatE-style). "
+                        "Instead of random NO_REL subsampling, uses the model's current "
+                        "predictions to preferentially sample hard negatives (pairs the "
+                        "model incorrectly scores as real relations). Requires "
+                        "--re-neg-subsample >0 to set the sampling budget.")
+    p.add_argument("--re-adv-temp", type=float, default=0.5,
+                   help="Temperature for self-adversarial RE sampling. Lower = sharper "
+                        "distribution (more focus on hardest negatives). Default 0.5.")
     p.add_argument("--doc-window-size", type=int, default=1,
                    help="For document-aware datasets, join N consecutive sentences "
                         "from the same source document into one context window. "
@@ -284,7 +293,8 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                       re_train_conf=0.5,
                       span_proposal=False, span_proposal_expand=1,
                       boundary_reg_weight=0.0, eer_alpha=0.0,
-                      re_neg_subsample=0.0):
+                      re_neg_subsample=0.0,
+                      re_adv_neg=False, re_adv_temp=0.5):
     """Compute span NER loss + RE loss + optional BIO auxiliary loss."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -474,7 +484,21 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                     n_pos_re = len(pos_idx)
                     if n_pos_re > 0 and len(neg_idx) > int(n_pos_re * re_neg_subsample):
                         n_neg_keep_re = int(n_pos_re * re_neg_subsample)
-                        neg_sample = random.sample(neg_idx, n_neg_keep_re)
+                        if re_adv_neg and n_neg_keep_re < len(neg_idx):
+                            # Self-adversarial sampling (RotatE-style): prefer hard negatives
+                            # that the model currently scores as real relations.
+                            with torch.no_grad():
+                                all_re_logits = model.forward_re(
+                                    hidden[b_idx], word_ids_list[b_idx], pairs)
+                                neg_logits = all_re_logits[neg_idx]  # (n_neg, n_rels)
+                                # Score = sum of non-NO_REL probabilities
+                                adv_scores = torch.softmax(neg_logits, dim=-1)[:, 1:].sum(dim=-1)
+                                adv_weights = torch.softmax(adv_scores / re_adv_temp, dim=0)
+                                sampled = torch.multinomial(
+                                    adv_weights, n_neg_keep_re, replacement=False).tolist()
+                            neg_sample = [neg_idx[i] for i in sampled]
+                        else:
+                            neg_sample = random.sample(neg_idx, n_neg_keep_re)
                         keep_idx = sorted(pos_idx + neg_sample)
                         pairs = [pairs[i] for i in keep_idx]
                         pair_targets = [pair_targets[i] for i in keep_idx]
@@ -836,6 +860,8 @@ def main():
                 boundary_reg_weight=args.boundary_reg_weight,
                 eer_alpha=args.eer_alpha,
                 re_neg_subsample=args.re_neg_subsample,
+                re_adv_neg=args.re_adv_neg,
+                re_adv_temp=args.re_adv_temp,
             )
             gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
                 model, batch, device, ds_mod, entity_type2id,
@@ -853,6 +879,8 @@ def main():
                 boundary_reg_weight=args.boundary_reg_weight,
                 eer_alpha=args.eer_alpha,
                 re_neg_subsample=args.re_neg_subsample,
+                re_adv_neg=args.re_adv_neg,
+                re_adv_temp=args.re_adv_temp,
             )
             # Average the two losses + symmetric KL on BIO logits
             gold_loss = (gold_loss + gold_loss2) / 2
@@ -881,6 +909,8 @@ def main():
                 boundary_reg_weight=args.boundary_reg_weight,
                 eer_alpha=args.eer_alpha,
                 re_neg_subsample=args.re_neg_subsample,
+                re_adv_neg=args.re_adv_neg,
+                re_adv_temp=args.re_adv_temp,
             )
 
         synth_loss_val = 0.0
