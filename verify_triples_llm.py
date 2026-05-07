@@ -70,10 +70,16 @@ def parse_args():
     p.add_argument("--mode", default="correct", choices=["simple", "correct"],
                    help="simple: Yes/No/Uncertain. correct: Keep/Correct/Discard.")
     p.add_argument("--max-docs", type=int, default=0, help="0 = all")
+    p.add_argument("--timeout", type=int, default=300,
+                   help="Per-request Ollama timeout in seconds.")
+    p.add_argument("--retries", type=int, default=3,
+                   help="Number of Ollama attempts per triple.")
+    p.add_argument("--retry-backoff", type=float, default=2.0,
+                   help="Initial retry delay in seconds; doubles after each failure.")
     return p.parse_args()
 
 
-def call_ollama(ollama_url, model, prompt):
+def call_ollama(ollama_url, model, prompt, timeout=300, retries=3, retry_backoff=2.0):
     """Call Ollama chat API with think:false for fast inference."""
     payload = json.dumps({
         "model": model,
@@ -82,17 +88,30 @@ def call_ollama(ollama_url, model, prompt):
         "think": False,
         "options": {"temperature": 0.0, "num_predict": 80},
     })
-    try:
-        result = subprocess.run(
-            ["curl", "-s", f"{ollama_url}/api/chat", "-d", payload],
-            capture_output=True, text=True, timeout=60,
-        )
-        resp = json.loads(result.stdout)
-        text = resp.get("message", {}).get("content", "").strip()
-        return text
-    except Exception as e:
-        print(f"  Ollama error: {e}")
-        return "Error"
+    delay = retry_backoff
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            result = subprocess.run(
+                ["curl", "-sS", f"{ollama_url}/api/chat", "-d", payload],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or f"curl exited {result.returncode}")
+            resp = json.loads(result.stdout)
+            text = resp.get("message", {}).get("content", "").strip()
+            if not text:
+                raise RuntimeError(f"empty Ollama response: {result.stdout[:200]}")
+            return text
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, RuntimeError) as e:
+            last_error = e
+            if attempt < retries:
+                print(f"  Ollama attempt {attempt}/{retries} failed: {e}; retrying in {delay:.1f}s")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                print(f"  Ollama failed after {retries} attempts: {e}")
+    return f"Error: {last_error}"
 
 
 def parse_verdict_simple(response):
@@ -154,6 +173,7 @@ def main():
     print(f"  Mode: {args.mode}")
     print(f"  Input: {args.input} ({len(records)} docs, {total_triples} triples)")
     print(f"  Min confidence: {args.min_triple_conf} → {eligible} triples to verify")
+    print(f"  Timeout/retry: {args.timeout}s, retries={args.retries}, backoff={args.retry_backoff}s")
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -180,7 +200,14 @@ def main():
                     relation=triple["relation"],
                     tail=triple["tail_text"],
                 )
-                response = call_ollama(args.ollama_url, args.ollama_model, prompt)
+                response = call_ollama(
+                    args.ollama_url,
+                    args.ollama_model,
+                    prompt,
+                    timeout=args.timeout,
+                    retries=args.retries,
+                    retry_backoff=args.retry_backoff,
+                )
                 verdict = parse_fn(response)
 
                 triple["llm_verdict"] = verdict["action"]

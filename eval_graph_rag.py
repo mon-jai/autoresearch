@@ -33,10 +33,18 @@ def parse_args():
                    help="Build KG from gold triples instead of using --kg. "
                         "Tests RAG pipeline ceiling without encoder errors.")
     p.add_argument("--output", default="results/graph_rag_eval.json")
+    p.add_argument("--timeout", type=int, default=300,
+                   help="Per-request Ollama timeout in seconds.")
+    p.add_argument("--retries", type=int, default=3,
+                   help="Number of Ollama attempts per prompt.")
+    p.add_argument("--retry-backoff", type=float, default=2.0,
+                   help="Initial retry delay in seconds; doubles after each failure.")
+    p.add_argument("--edge-source-context", action="store_true",
+                   help="Also evaluate a hybrid mode that includes source sentences stored on KG edges.")
     return p.parse_args()
 
 
-def call_llm(ollama_url, model, prompt):
+def call_llm(ollama_url, model, prompt, timeout=300, retries=3, retry_backoff=2.0):
     """On-premise LLM call via Ollama."""
     payload = json.dumps({
         "model": model,
@@ -45,15 +53,30 @@ def call_llm(ollama_url, model, prompt):
         "think": False,
         "options": {"temperature": 0.0, "num_predict": 50},
     })
-    try:
-        result = subprocess.run(
-            ["curl", "-s", f"{ollama_url}/api/chat", "-d", payload],
-            capture_output=True, text=True, timeout=60,
-        )
-        resp = json.loads(result.stdout)
-        return resp.get("message", {}).get("content", "").strip()
-    except Exception as e:
-        return f"ERROR: {e}"
+    delay = retry_backoff
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            result = subprocess.run(
+                ["curl", "-sS", f"{ollama_url}/api/chat", "-d", payload],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or f"curl exited {result.returncode}")
+            resp = json.loads(result.stdout)
+            text = resp.get("message", {}).get("content", "").strip()
+            if not text:
+                raise RuntimeError(f"empty Ollama response: {result.stdout[:200]}")
+            return text
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, RuntimeError) as e:
+            last_error = e
+            if attempt < retries:
+                print(f"  Ollama attempt {attempt}/{retries} failed: {e}; retrying in {delay:.1f}s")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                print(f"  Ollama failed after {retries} attempts: {e}")
+    return f"ERROR: {last_error}"
 
 
 def generate_questions(records, max_q):
@@ -73,6 +96,13 @@ def generate_questions(records, max_q):
         "subtask-of": ("What is {head} a subtask of?", "{tail}"),
         "synonym-of": ("What is a synonym of {head}?", "{tail}"),
         "benchmark-for": ("What is {head} a benchmark for?", "{tail}"),
+        "necessity": ("What is required for {head}?", "{tail}"),
+        "selection": ("What is selected or specified for {head}?", "{tail}"),
+        "equal": ("What is {head} equal to?", "{tail}"),
+        "greater-equal": ("What is the minimum value for {head}?", "{tail}"),
+        "less-equal": ("What is the maximum value for {head}?", "{tail}"),
+        "greater": ("What value is {head} greater than?", "{tail}"),
+        "less": ("What value is {head} less than?", "{tail}"),
     }
 
     for rec in records:
@@ -108,7 +138,15 @@ def generate_questions(records, max_q):
     return unique
 
 
-def retrieve_from_kg(kg, query_entity, hops=1):
+def format_edge(edge, include_sources=False):
+    text = f"({edge['head']}, {edge['relation']}, {edge['tail']})"
+    if include_sources and edge.get("source_sentences"):
+        source = edge["source_sentences"][0][:220]
+        text += f" [source: {source}]"
+    return text
+
+
+def retrieve_from_kg(kg, query_entity, hops=1, include_sources=False):
     """Retrieve KG subgraph around an entity (multi-hop neighborhood)."""
     query_norm = query_entity.lower().strip()
 
@@ -146,9 +184,7 @@ def retrieve_from_kg(kg, query_entity, hops=1):
                 edge_key = (edge["head"], edge["relation"], edge["tail"])
                 if edge_key not in seen_edges:
                     seen_edges.add(edge_key)
-                    context_triples.append(
-                        f"({edge['head']}, {edge['relation']}, {edge['tail']})"
-                    )
+                    context_triples.append(format_edge(edge, include_sources))
                     next_frontier.add(edge["head"].lower())
                     next_frontier.add(edge["tail"].lower())
         frontier = next_frontier - visited
@@ -218,12 +254,15 @@ def main():
 
     print(f"  KG: {len(kg['nodes'])} nodes, {len(kg['edges'])} edges")
     print(f"  Model: {args.ollama_model}")
+    print(f"  Timeout/retry: {args.timeout}s, retries={args.retries}, backoff={args.retry_backoff}s")
 
     # Generate questions
     questions = generate_questions(records, args.max_questions)
     print(f"  Questions: {len(questions)}")
 
     modes = ["llm_only", "text_retrieval", "kg_1hop", "kg_2hop", "hybrid"]
+    if args.edge_source_context:
+        modes.append("hybrid_edge_source")
     results = {m: [] for m in modes}
     correct = {m: 0 for m in modes}
     t0 = time.time()
@@ -231,14 +270,16 @@ def main():
     for i, q in enumerate(questions):
         # Mode 1: LLM only
         prompt1 = f"Answer in 1-2 words. {q['question']}"
-        ans1 = call_llm(args.ollama_url, args.ollama_model, prompt1)
+        ans1 = call_llm(args.ollama_url, args.ollama_model, prompt1,
+                        args.timeout, args.retries, args.retry_backoff)
 
         # Mode 2: Text retrieval
         retrieved_sents = retrieve_sentences(records, q["head"] + " " + q["tail"])
         context2 = "\n".join(f"- {s[:200]}" for s in retrieved_sents)
         prompt2 = (f"Based on these scientific sentences:\n{context2}\n\n"
                    f"Answer in 1-2 words: {q['question']}")
-        ans2 = call_llm(args.ollama_url, args.ollama_model, prompt2)
+        ans2 = call_llm(args.ollama_url, args.ollama_model, prompt2,
+                        args.timeout, args.retries, args.retry_backoff)
 
         # Mode 3: KG 1-hop
         kg_1hop = retrieve_from_kg(kg, q["head"], hops=1)
@@ -247,7 +288,8 @@ def main():
         context3 = "\n".join(f"- {t}" for t in kg_1hop)
         prompt3 = (f"Based on this knowledge graph:\n{context3}\n\n"
                    f"Answer in 1-2 words: {q['question']}")
-        ans3 = call_llm(args.ollama_url, args.ollama_model, prompt3)
+        ans3 = call_llm(args.ollama_url, args.ollama_model, prompt3,
+                        args.timeout, args.retries, args.retry_backoff)
 
         # Mode 4: KG 2-hop
         kg_2hop = retrieve_from_kg(kg, q["head"], hops=2)
@@ -256,7 +298,8 @@ def main():
         context4 = "\n".join(f"- {t}" for t in kg_2hop)
         prompt4 = (f"Based on this knowledge graph:\n{context4}\n\n"
                    f"Answer in 1-2 words: {q['question']}")
-        ans4 = call_llm(args.ollama_url, args.ollama_model, prompt4)
+        ans4 = call_llm(args.ollama_url, args.ollama_model, prompt4,
+                        args.timeout, args.retries, args.retry_backoff)
 
         # Mode 5: Hybrid (KG triples + top retrieved sentence)
         top_sent = retrieved_sents[0][:200] if retrieved_sents else ""
@@ -264,10 +307,22 @@ def main():
         context5 += f"\n\nSource text:\n- {top_sent}"
         prompt5 = (f"Based on this evidence:\n{context5}\n\n"
                    f"Answer in 1-2 words: {q['question']}")
-        ans5 = call_llm(args.ollama_url, args.ollama_model, prompt5)
+        ans5 = call_llm(args.ollama_url, args.ollama_model, prompt5,
+                        args.timeout, args.retries, args.retry_backoff)
 
         # Evaluate all modes
         answers = [ans1, ans2, ans3, ans4, ans5]
+        if args.edge_source_context:
+            kg_1hop_sources = retrieve_from_kg(kg, q["head"], hops=1, include_sources=True)
+            if not kg_1hop_sources:
+                kg_1hop_sources = retrieve_from_kg(kg, q["tail"], hops=1, include_sources=True)
+            context6 = "Knowledge graph evidence:\n" + "\n".join(f"- {t}" for t in kg_1hop_sources[:5])
+            context6 += f"\n\nSource text:\n- {top_sent}"
+            prompt6 = (f"Based on this evidence:\n{context6}\n\n"
+                       f"Answer in 1-2 words: {q['question']}")
+            ans6 = call_llm(args.ollama_url, args.ollama_model, prompt6,
+                            args.timeout, args.retries, args.retry_backoff)
+            answers.append(ans6)
         for mode, ans in zip(modes, answers):
             c = check_answer(ans, q["gold_answer"])
             correct[mode] += int(c)
