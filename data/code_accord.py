@@ -36,6 +36,11 @@ REL2ID = {"NO_REL": NO_REL_ID, **{r: i + 1 for i, r in enumerate(RELATION_TYPES)
 ID2REL = {i: r for r, i in REL2ID.items()}
 NUM_RELATIONS = len(REL2ID)  # 10
 
+# Comparison/numeric relation IDs for class-weighted loss (see A11 experiment).
+# These relations are rare (equal=51, greater=32, greater-equal=74, less=7, less-equal=41
+# out of 2200 training relations) yet have 0% evidence-path reachability.
+COMPARISON_REL_IDS = [5, 6, 7, 8, 9]  # equal, greater, greater-equal, less, less-equal
+
 
 def _doc_id_from_metadata(raw: str) -> str:
     """Extract source document ID from CODE-ACCORD metadata."""

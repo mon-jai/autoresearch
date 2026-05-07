@@ -152,6 +152,13 @@ def parse_args():
     p.add_argument("--re-adv-temp", type=float, default=0.5,
                    help="Temperature for self-adversarial RE sampling. Lower = sharper "
                         "distribution (more focus on hardest negatives). Default 0.5.")
+    p.add_argument("--re-comparison-boost", type=float, default=1.0,
+                   help="Loss weight multiplier for comparison/numeric relation classes "
+                        "(equal, greater, greater-equal, less, less-equal). "
+                        "These are rare (32-74 training instances vs 676-773 for main "
+                        "relations) and have 0%% evidence-path reachability. "
+                        "Value >1.0 upweights these classes in the RE cross-entropy. "
+                        "Recommended: 3.0-8.0. Default 1.0 (no boost).")
     p.add_argument("--doc-window-size", type=int, default=1,
                    help="For document-aware datasets, join N consecutive sentences "
                         "from the same source document into one context window. "
@@ -294,7 +301,8 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                       span_proposal=False, span_proposal_expand=1,
                       boundary_reg_weight=0.0, eer_alpha=0.0,
                       re_neg_subsample=0.0,
-                      re_adv_neg=False, re_adv_temp=0.5):
+                      re_adv_neg=False, re_adv_temp=0.5,
+                      re_comparison_boost=1.0):
     """Compute span NER loss + RE loss + optional BIO auxiliary loss."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -505,11 +513,22 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
 
                 pair_targets_t = torch.tensor(pair_targets, device=device, dtype=torch.long)
                 re_logits = model.forward_re(hidden[b_idx], word_ids_list[b_idx], pairs)
+                # Build class weight tensor for comparison relation boost (A11)
+                re_class_w = None
+                if re_comparison_boost > 1.0:
+                    comparison_ids = getattr(ds_mod, 'COMPARISON_REL_IDS', [])
+                    if comparison_ids:
+                        re_class_w = re_logits.new_ones(re_logits.size(-1))
+                        for cid in comparison_ids:
+                            if cid < re_class_w.size(0):
+                                re_class_w[cid] = re_comparison_boost
                 if re_focal_gamma > 0:
                     re_losses.append(focal_loss(re_logits, pair_targets_t,
-                                                gamma=re_focal_gamma))
+                                                gamma=re_focal_gamma,
+                                                weights=re_class_w))
                 else:
-                    re_losses.append(F.cross_entropy(re_logits, pair_targets_t))
+                    re_losses.append(F.cross_entropy(re_logits, pair_targets_t,
+                                                     weight=re_class_w))
 
     ner_loss = torch.stack(span_losses).mean() if span_losses else hidden.new_tensor(0.0)
     re_loss = torch.stack(re_losses).mean() if re_losses else hidden.new_tensor(0.0)
@@ -862,6 +881,7 @@ def main():
                 re_neg_subsample=args.re_neg_subsample,
                 re_adv_neg=args.re_adv_neg,
                 re_adv_temp=args.re_adv_temp,
+                re_comparison_boost=args.re_comparison_boost,
             )
             gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
                 model, batch, device, ds_mod, entity_type2id,
@@ -881,6 +901,7 @@ def main():
                 re_neg_subsample=args.re_neg_subsample,
                 re_adv_neg=args.re_adv_neg,
                 re_adv_temp=args.re_adv_temp,
+                re_comparison_boost=args.re_comparison_boost,
             )
             # Average the two losses + symmetric KL on BIO logits
             gold_loss = (gold_loss + gold_loss2) / 2
@@ -911,6 +932,7 @@ def main():
                 re_neg_subsample=args.re_neg_subsample,
                 re_adv_neg=args.re_adv_neg,
                 re_adv_temp=args.re_adv_temp,
+                re_comparison_boost=args.re_comparison_boost,
             )
 
         synth_loss_val = 0.0
