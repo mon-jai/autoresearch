@@ -178,6 +178,24 @@ def parse_args():
                         "1 keeps sentence-level training.")
     p.add_argument("--doc-window-stride", type=int, default=1,
                    help="Stride for --doc-window-size sliding windows.")
+    p.add_argument("--evidence-gat", action="store_true",
+                   help="Phase B3 ECRG: Enable Evidence Graph Attention Network. "
+                        "Processes one full document per training step — encodes each "
+                        "sentence independently with DeBERTa, builds an entity evidence "
+                        "graph (center-sentence heuristic), runs 2-layer EvidenceGAT "
+                        "to enrich entity representations with cross-sentence context, "
+                        "then uses enriched representations for RE prediction. "
+                        "Uses build_doc_dataloaders (doc-level batching). "
+                        "Incompatible with --doc-window-size > 1.")
+    p.add_argument("--evidence-gat-gap", type=int, default=1,
+                   help="Phase B3: Max sentence gap for evidence graph edges. "
+                        "1 = same-sentence or adjacent sentences only (default). "
+                        "2 = also connect sentences 2 apart. "
+                        "Higher values → denser graph but slower GAT.")
+    p.add_argument("--evidence-gat-heads", type=int, default=4,
+                   help="Phase B3: Number of attention heads in EvidenceGAT (default: 4).")
+    p.add_argument("--evidence-gat-layers", type=int, default=2,
+                   help="Phase B3: Number of EvidenceGAT layers (default: 2).")
     args = p.parse_args()
     # Resolve cycle aliases
     if args.cycle_jsonl_alias and not args.synth_jsonl:
@@ -302,6 +320,173 @@ def _build_span_labels(gold_entities, num_words, max_span_width, entity_type2id)
             if etype_id > 0:
                 gold_span_labels[(s, e)] = etype_id
     return gold_span_labels
+
+
+def compute_doc_loss(model, doc_batch, device, ds_mod, entity_type2id,
+                     re_weight=1.0, neg_sample_ratio=0.5, max_span_width=8,
+                     re_comparison_boost=1.0, bio_weight=0.0):
+    """
+    Phase B3: Document-level loss with Evidence GAT.
+
+    Processes one document (all its sentences) per call. Encodes each sentence
+    independently with DeBERTa, collects gold entity spans as graph nodes,
+    runs model.evidence_gat for cross-sentence enrichment, then computes
+    NER and RE losses across all sentences.
+
+    Args:
+        doc_batch: list of sentence dicts (from collate_doc). Each dict has:
+            input_ids:      (1, T) tensor
+            attention_mask: (1, T) tensor
+            ner_labels:     (1, T) tensor
+            word_ids:       [list[int|None]]
+            gold_entities:  [list of (s, e, type_str)]
+            gold_relations: [list of ((hs,he),(ts,te),rel_id)]
+        model:  BertKGExtractor with model.evidence_gat set (or None for ablation)
+        ...
+
+    Returns:
+        (total_loss, ner_loss_detached, re_loss_detached)
+    """
+    from models.bert_kg_encoder import build_evidence_graph
+
+    ner_losses = []
+    all_hidden = []       # (T_i, H) per sentence
+    all_word_ids = []     # list of word_ids per sentence
+    all_gold_ents = []    # list of [(s, e, type)] per sentence
+    all_gold_rels = []    # list of [((hs,he),(ts,te),rid)] per sentence
+    no_rel_id = ds_mod.NO_REL_ID
+
+    # ── Step 1: Encode each sentence → NER loss ─────────────────────────
+    for sent in doc_batch:
+        input_ids = sent["input_ids"].to(device)       # (1, T)
+        attention_mask = sent["attention_mask"].to(device)
+        ner_labels = sent["ner_labels"].to(device)
+        word_ids = sent["word_ids"][0]
+        gold_ents = sent["gold_entities"][0]
+        gold_rels = sent["gold_relations"][0]
+
+        hidden = model.encode(
+            modality="text",
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )  # (1, T, H)
+
+        # NER auxiliary loss (span NER + BIO if bio_weight > 0)
+        ner_logits = model.forward_ner(hidden)
+        ner_loss = F.cross_entropy(
+            ner_logits.view(-1, ner_logits.size(-1)),
+            ner_labels.view(-1),
+            ignore_index=-100,
+        )
+
+        if bio_weight > 0:
+            ner_losses.append(ner_loss * (1.0 + bio_weight))
+        else:
+            ner_losses.append(ner_loss)
+
+        all_hidden.append(hidden[0])   # (T_i, H) — drop batch dim
+        all_word_ids.append(word_ids)
+        all_gold_ents.append(gold_ents)
+        all_gold_rels.append(gold_rels)
+
+    ner_loss_total = torch.stack(ner_losses).mean() if ner_losses else \
+        all_hidden[0].new_tensor(0.0)
+
+    # ── Step 2: Build entity node list with sentence IDs ─────────────────
+    entity_spans_by_sent = []   # list[list[(s,e)]] per sentence
+    entity_sent_ids = []        # sentence id per global node
+    node_to_sent_span = []      # (sent_idx, (s,e)) per global node
+
+    for sent_idx, gold_ents in enumerate(all_gold_ents):
+        sent_spans = [(s, e) for (s, e, _) in gold_ents]
+        entity_spans_by_sent.append(sent_spans)
+        for span in sent_spans:
+            entity_sent_ids.append(sent_idx)
+            node_to_sent_span.append((sent_idx, span))
+
+    if not any(entity_spans_by_sent):
+        # No entities in document — only NER loss
+        return ner_loss_total, ner_loss_total.detach(), ner_loss_total.new_tensor(0.0)
+
+    # ── Step 3: Build pairs_by_sent with global node indices ─────────────
+    # node_idx_by_sent[sent_idx][(s,e)] → global node index
+    node_idx_by_sent = []
+    global_idx = 0
+    for sent_spans in entity_spans_by_sent:
+        span_to_gidx = {}
+        for span in sent_spans:
+            span_to_gidx[span] = global_idx
+            global_idx += 1
+        node_idx_by_sent.append(span_to_gidx)
+
+    pairs_by_sent = []
+    for sent_idx, gold_rels in enumerate(all_gold_rels):
+        gold_ents_sent = all_gold_ents[sent_idx]
+        span_to_gidx = node_idx_by_sent[sent_idx]
+        if not gold_ents_sent:
+            pairs_by_sent.append([])
+            continue
+
+        rel_lookup = {(h, t): rid for (h, t, rid) in gold_rels}
+        spans = [(s, e) for (s, e, _) in gold_ents_sent]
+        all_pairs = [(h, t) for h in spans for t in spans if h != t]
+
+        # Negative subsampling
+        pos_pairs = [(h, t) for (h, t) in all_pairs if (h, t) in rel_lookup]
+        neg_pairs = [(h, t) for (h, t) in all_pairs if (h, t) not in rel_lookup]
+        if neg_sample_ratio > 0 and neg_pairs:
+            n_keep = max(len(pos_pairs), int(len(neg_pairs) * neg_sample_ratio))
+            n_keep = min(n_keep, len(neg_pairs))
+            neg_pairs = neg_pairs[:n_keep]  # simple truncation (shuffled at dataset level)
+        kept_pairs = pos_pairs + neg_pairs
+
+        sent_pairs = []
+        for (h, t) in kept_pairs:
+            h_gidx = span_to_gidx.get(h)
+            t_gidx = span_to_gidx.get(t)
+            if h_gidx is not None and t_gidx is not None:
+                sent_pairs.append((h, t, h_gidx, t_gidx))
+        pairs_by_sent.append(sent_pairs)
+
+    # ── Step 4: Evidence GAT + RE logits ─────────────────────────────────
+    re_logits_by_sent = model.forward_re_with_graph(
+        hidden_states_list=all_hidden,
+        word_ids_list=all_word_ids,
+        entity_spans_by_sent=entity_spans_by_sent,
+        pairs_by_sent=pairs_by_sent,
+        entity_sent_ids=entity_sent_ids,
+    )
+
+    # ── Step 5: RE cross-entropy loss ────────────────────────────────────
+    re_losses = []
+    comparison_rel_ids = getattr(ds_mod, "COMPARISON_REL_IDS", [])
+
+    for sent_idx, (sent_pairs, re_logits) in enumerate(
+            zip(pairs_by_sent, re_logits_by_sent)):
+        if not sent_pairs or re_logits is None:
+            continue
+        gold_rels = all_gold_rels[sent_idx]
+        rel_lookup = {(h, t): rid for (h, t, rid) in gold_rels}
+        targets = [rel_lookup.get((h, t), no_rel_id) for (h, t, _, _) in sent_pairs]
+        targets_t = torch.tensor(targets, device=device, dtype=torch.long)
+
+        # Class weighting for rare comparison relations (A11-compatible)
+        re_class_w = None
+        if re_comparison_boost > 1.0 and comparison_rel_ids:
+            re_class_w = re_logits.new_ones(re_logits.size(-1))
+            for cid in comparison_rel_ids:
+                if cid < re_class_w.size(0):
+                    re_class_w[cid] = re_comparison_boost
+
+        re_losses.append(F.cross_entropy(re_logits, targets_t, weight=re_class_w))
+
+    if re_losses:
+        re_loss = torch.stack(re_losses).mean()
+    else:
+        re_loss = ner_loss_total.new_tensor(0.0)
+
+    total = ner_loss_total + re_weight * re_loss
+    return total, ner_loss_total.detach(), re_loss.detach()
 
 
 def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
@@ -757,18 +942,36 @@ def main():
     # making multi-seed evaluation measure true generalization, not init luck on a
     # single fixed dev set.
     import inspect
-    dl_kwargs = dict(batch_size=args.batch_size, max_length=args.max_length)
-    dl_params = inspect.signature(ds_mod.build_dataloaders).parameters
-    if "seed" in dl_params:
-        dl_kwargs["seed"] = args.seed
-    if "doc_window_size" in dl_params:
-        dl_kwargs["doc_window_size"] = args.doc_window_size
-    if "doc_window_stride" in dl_params:
-        dl_kwargs["doc_window_stride"] = args.doc_window_stride
-    train_loader, dev_loader, test_loader = ds_mod.build_dataloaders(
-        tokenizer, **dl_kwargs,
-    )
-    print(f"  train: {len(train_loader.dataset)} | dev: {len(dev_loader.dataset)}")
+    # Phase B3: --evidence-gat uses document-level dataloaders for training.
+    # Eval still uses sentence-level dataloaders (GAT temporarily disabled at eval).
+    # Both use the same seed so dev splits are identical.
+    if args.evidence_gat and hasattr(ds_mod, "build_doc_dataloaders"):
+        doc_dl_params = inspect.signature(ds_mod.build_doc_dataloaders).parameters
+        doc_dl_kwargs = dict(max_length=args.max_length)
+        if "seed" in doc_dl_params:
+            doc_dl_kwargs["seed"] = args.seed
+        train_loader, _, _ = ds_mod.build_doc_dataloaders(tokenizer, **doc_dl_kwargs)
+        print(f"  doc-level train: {len(train_loader.dataset)} docs")
+        # Sentence-level loaders for eval (same seed → same dev split)
+        dl_kwargs = dict(batch_size=args.batch_size, max_length=args.max_length)
+        dl_params = inspect.signature(ds_mod.build_dataloaders).parameters
+        if "seed" in dl_params:
+            dl_kwargs["seed"] = args.seed
+        _, dev_loader, test_loader = ds_mod.build_dataloaders(tokenizer, **dl_kwargs)
+        print(f"  sent-level eval: dev={len(dev_loader.dataset)} test={len(test_loader.dataset)}")
+    else:
+        dl_kwargs = dict(batch_size=args.batch_size, max_length=args.max_length)
+        dl_params = inspect.signature(ds_mod.build_dataloaders).parameters
+        if "seed" in dl_params:
+            dl_kwargs["seed"] = args.seed
+        if "doc_window_size" in dl_params:
+            dl_kwargs["doc_window_size"] = args.doc_window_size
+        if "doc_window_stride" in dl_params:
+            dl_kwargs["doc_window_stride"] = args.doc_window_stride
+        train_loader, dev_loader, test_loader = ds_mod.build_dataloaders(
+            tokenizer, **dl_kwargs,
+        )
+        print(f"  train: {len(train_loader.dataset)} | dev: {len(dev_loader.dataset)}")
 
     # Entity type mapping: type_name -> id (1-indexed, 0 = NONE)
     entity_types = ds_mod.ENTITY_TYPES
@@ -818,6 +1021,19 @@ def main():
         n_rel = ds_mod.NUM_RELATIONS
         model.global_rel_head = torch.nn.Linear(hidden, n_rel - 1).to(device)  # exclude NO_REL
         print(f"  global_rel_head: enabled (weight={args.global_rel_weight})")
+
+    # Phase B3: Evidence GAT initialization.
+    if args.evidence_gat:
+        from models.bert_kg_encoder import EvidenceGAT
+        hidden = model.backbone.hidden_size
+        model.evidence_gat = EvidenceGAT(
+            hidden_dim=hidden,
+            num_heads=args.evidence_gat_heads,
+            num_layers=args.evidence_gat_layers,
+        ).to(device)
+        model.evidence_gat_gap = args.evidence_gat_gap
+        print(f"  evidence_gat: enabled ({args.evidence_gat_layers} layers, "
+              f"{args.evidence_gat_heads} heads, gap={args.evidence_gat_gap})")
 
     # Load ELECTRA cooperative pre-training checkpoint if provided
     if args.pretrain_ckpt:
@@ -909,6 +1125,60 @@ def main():
             bio_w_eff = args.bio_start - (args.bio_start - args.bio_end) * (step / max(args.max_steps - 1, 1))
         else:
             bio_w_eff = args.bio_weight
+
+        # Phase B3: Evidence GAT document-level loss
+        if args.evidence_gat:
+            # doc_batch is a list of sentence dicts (one per sentence in this doc)
+            doc_batch = batch  # batch = list of sentence dicts from collate_doc
+            gold_loss, ner_loss, re_loss = compute_doc_loss(
+                model, doc_batch, device, ds_mod, entity_type2id,
+                re_weight=args.re_weight,
+                neg_sample_ratio=args.neg_sample_ratio,
+                max_span_width=args.max_span_width,
+                re_comparison_boost=args.re_comparison_boost,
+                bio_weight=bio_w_eff,
+            )
+            cl_loss = gold_loss.new_tensor(0.0)
+            bio_l = gold_loss.new_tensor(bio_w_eff)
+            gold_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            step += 1
+            elapsed = time.time() - t0
+            if step % 10 == 0:
+                ms_per_step = elapsed / step * 1000
+                print(f"[Step {step:04d}] L={gold_loss.item():.4f} "
+                      f"NER={ner_loss.item():.4f} RE={re_loss.item():.4f} "
+                      f"BIO={bio_l.item():.4f}(w={bio_w_eff:.3f}) "
+                      f"lr={scheduler.get_last_lr()[0]:.2e} | {ms_per_step:.0f}ms/step",
+                      flush=True)
+            if step % args.eval_every == 0 or step == args.max_steps:
+                # Eval: temporarily disable GAT (sentence-level eval)
+                # EvidenceGAT has a residual connection so disabling it gives
+                # the "un-enriched" baseline representation, which is still valid
+                # for the RE head (same 2H input shape).
+                saved_gat = model.evidence_gat
+                model.evidence_gat = None
+                eval_metrics = evaluate_span(
+                    model, dev_loader, device, ds_mod,
+                    entity_type2id=entity_type2id,
+                    id2entity_type=id2entity_type,
+                    max_span_width=args.max_span_width,
+                )
+                model.evidence_gat = saved_gat
+                triple_f1 = eval_metrics.get("triple_f1", 0.0)
+                ner_f1 = eval_metrics.get("ner_f1", 0.0)
+                print(f"[Eval @ {step}] NER={ner_f1:.4f} Triple={triple_f1:.4f} "
+                      f"{'*' if triple_f1 > best_metrics['triple_f1'] else ''}",
+                      flush=True)
+                if triple_f1 > best_metrics["triple_f1"]:
+                    best_metrics = eval_metrics
+                    best_step = step
+                    if args.save_best_to:
+                        torch.save(model.state_dict(), args.save_best_to)
+                model.train()
+            continue  # skip standard training path below
 
         use_rdrop = args.rdrop_weight > 0
         if use_rdrop:

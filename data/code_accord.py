@@ -344,6 +344,205 @@ def collate_fn(batch, pad_token_id: int = 0):
 DEFAULT_DATA_DIR = Path(__file__).parent / "code_accord"
 
 
+class DocGroupDataset(Dataset):
+    """
+    Phase B3: Document-level dataset for Evidence GAT training.
+
+    Each item is a list of tokenized sentence examples from the same document.
+    The training loop encodes each sentence independently with DeBERTa, then
+    runs the Evidence GAT over entity representations from the whole document.
+
+    Unlike CodeAccordDataset (sentence-level), this dataset groups by doc_id
+    so that cross-sentence entity interactions can be modeled.
+    """
+
+    def __init__(self, doc_groups: list, tokenizer, max_length: int = 128):
+        """
+        Args:
+            doc_groups: list of lists — each inner list is the examples from
+                        one document, already sorted by sentence sequence.
+            tokenizer:  HF tokenizer for encoding words.
+            max_length: max token length per sentence (not per document).
+        """
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.doc_groups = doc_groups  # list of lists of sentence examples
+
+    def __len__(self):
+        return len(self.doc_groups)
+
+    def __getitem__(self, idx):
+        """Returns list of tokenized sentence dicts for one document."""
+        sents = self.doc_groups[idx]
+        result = []
+        for ex in sents:
+            words = ex["words"]
+            encoding = self.tokenizer(
+                words,
+                is_split_into_words=True,
+                padding=False,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors=None,
+            )
+            input_ids = encoding["input_ids"]
+            attention_mask = encoding["attention_mask"]
+            word_ids = encoding.word_ids()
+
+            word_bio = _bio_tags_for_sentence(len(words), ex["ner"])
+            token_labels = []
+            prev_word_id = None
+            for wid in word_ids:
+                if wid is None:
+                    token_labels.append(-100)
+                elif wid != prev_word_id:
+                    token_labels.append(word_bio[wid])
+                else:
+                    token_labels.append(-100)
+                prev_word_id = wid
+
+            result.append({
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "word_ids": word_ids,
+                "ner_labels": token_labels,
+                "gold_entities": ex["ner"],
+                "gold_relations": ex["relations"],
+                "num_words": len(words),
+                "words": words,
+                "doc_id": ex.get("doc_id", ""),
+                "example_id": ex.get("example_id", ""),
+            })
+        return result
+
+
+def collate_doc(docs, pad_token_id: int = 0):
+    """
+    Collate function for DocGroupDataset. Each call receives a list of length 1
+    (since doc-level DataLoader uses batch_size=1). Returns a flat list of
+    tokenized sentence dicts padded within this batch.
+
+    Each sentence dict in the returned list has tensors ready for the model:
+        input_ids:      (1, T_i)  — padded
+        attention_mask: (1, T_i)
+        ner_labels:     (1, T_i)
+        word_ids:       list[int|None]
+        gold_entities:  list of (s, e, type) tuples
+        gold_relations: list of ((hs,he), (ts,te), rel_id) tuples
+    """
+    assert len(docs) == 1, "DocGroupDataset must use DataLoader(batch_size=1)"
+    sents = docs[0]  # list of sentence dicts
+    result = []
+    for sent in sents:
+        L = len(sent["input_ids"])
+        input_ids = torch.tensor(sent["input_ids"], dtype=torch.long).unsqueeze(0)
+        attn_mask = torch.tensor(sent["attention_mask"], dtype=torch.long).unsqueeze(0)
+        ner_labels = torch.tensor(sent["ner_labels"], dtype=torch.long).unsqueeze(0)
+        result.append({
+            "input_ids": input_ids,
+            "attention_mask": attn_mask,
+            "ner_labels": ner_labels,
+            "word_ids": [sent["word_ids"]],
+            "gold_entities": [sent["gold_entities"]],
+            "gold_relations": [sent["gold_relations"]],
+            "num_words": [sent["num_words"]],
+            "words": [sent["words"]],
+            "doc_id": sent.get("doc_id", ""),
+            "example_id": sent.get("example_id", ""),
+        })
+    return result
+
+
+def build_doc_dataloaders(tokenizer, data_dir=None, batch_size: int = 1,
+                          max_length: int = 128, num_workers: int = 0,
+                          dev_ratio: float = 0.15, seed: int = 42):
+    """
+    Phase B3: Document-level dataloaders for Evidence GAT training.
+
+    Unlike build_dataloaders (sentence-level), each iteration yields all
+    sentences from one document. batch_size is fixed to 1 document per step.
+
+    Returns:
+        (train_loader, dev_loader, test_loader) — same interface as
+        build_dataloaders but each batch is a list of sentence dicts.
+    """
+    data_dir = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
+    pad_id = tokenizer.pad_token_id
+
+    ent_train = _load_entities(data_dir / "entities" / "train.csv")
+    rel_train = _load_relations(data_dir / "relations" / "train.csv", ent_train)
+    ent_test = _load_entities(data_dir / "entities" / "test.csv")
+    rel_test = _load_relations(data_dir / "relations" / "test.csv", ent_test)
+
+    def _merge(ent_data, rel_data, require_entities=False):
+        examples = []
+        all_ids = list(ent_data.keys()) if require_entities else (
+            list(ent_data.keys()) + [e for e in rel_data.keys() if e not in ent_data]
+        )
+        for eid in all_ids:
+            if eid in ent_data:
+                words = ent_data[eid]["words"]
+                ner = ent_data[eid]["ner"]
+                doc_id = ent_data[eid].get("doc_id", "UNKNOWN")
+            elif eid in rel_data:
+                words = rel_data[eid]["words"]
+                ner = []
+                doc_id = rel_data[eid].get("doc_id", "UNKNOWN")
+            else:
+                continue
+            relations = rel_data[eid]["relations"] if eid in rel_data else []
+            examples.append({
+                "example_id": eid,
+                "doc_id": doc_id,
+                "seq": ent_data.get(eid, rel_data.get(eid, {})).get("seq", 0),
+                "words": words,
+                "ner": ner,
+                "relations": relations,
+            })
+        return examples
+
+    train_examples = _merge(ent_train, rel_train, require_entities=False)
+    test_examples = _merge(ent_test, rel_test, require_entities=True)
+
+    rng = random.Random(seed)
+    rng.shuffle(train_examples)
+    n_dev = int(len(train_examples) * dev_ratio)
+    dev_examples = train_examples[:n_dev]
+    train_examples = train_examples[n_dev:]
+
+    def _group_by_doc(examples):
+        """Group and sort sentences by doc_id → list of doc groups."""
+        by_doc = {}
+        for ex in examples:
+            by_doc.setdefault(ex.get("doc_id", "UNKNOWN"), []).append(ex)
+        groups = []
+        for doc_id, doc_exs in by_doc.items():
+            doc_exs = sorted(doc_exs, key=lambda e: e.get("seq", 0))
+            groups.append(doc_exs)
+        return groups
+
+    train_groups = _group_by_doc(train_examples)
+    dev_groups = _group_by_doc(dev_examples)
+    test_groups = _group_by_doc(test_examples)
+
+    n_train_sents = sum(len(g) for g in train_groups)
+    n_dev_sents = sum(len(g) for g in dev_groups)
+    print(f"  CODE-ACCORD (doc-level): train={len(train_groups)} docs ({n_train_sents} sents) "
+          f"dev={len(dev_groups)} docs ({n_dev_sents} sents) "
+          f"test={len(test_groups)} docs")
+    print(f"  Train rels: {sum(len(e['relations']) for g in train_groups for e in g)}")
+    print(f"  Dev rels:   {sum(len(e['relations']) for g in dev_groups for e in g)}")
+
+    def make_loader(groups, shuffle):
+        ds = DocGroupDataset(groups, tokenizer, max_length)
+        return DataLoader(
+            ds, batch_size=1, shuffle=shuffle, num_workers=num_workers,
+            collate_fn=lambda b: collate_doc(b, pad_token_id=pad_id),
+        )
+
+    return make_loader(train_groups, True), make_loader(dev_groups, False), make_loader(test_groups, False)
+
+
 def build_dataloaders(tokenizer, data_dir=None, batch_size: int = 16,
                       max_length: int = 128, num_workers: int = 0,
                       dev_ratio: float = 0.15, seed: int = 42,

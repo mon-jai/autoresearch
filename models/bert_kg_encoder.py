@@ -35,6 +35,13 @@ no surgery on the model body or heads.
 
 Stage 2 training loss (unchanged from prior version):
     L = NER cross-entropy + λ · RE cross-entropy(NUM_RELATIONS=8 incl. NO_REL)
+
+Phase B3 (ECRG-style evidence graph):
+    After per-sentence DeBERTa encoding, collect entity span representations
+    across all sentences of a document. Build an evidence graph (center-sentence
+    heuristic: edge if entities appear in the same or adjacent sentences).
+    Run 2-layer EvidenceGATLayer over entity nodes. Use enriched representations
+    for cross-sentence RE prediction. Enabled via --evidence-gat flag.
 """
 import torch
 import torch.nn as nn
@@ -42,6 +49,138 @@ import torch.nn.functional as F
 from transformers import AutoModel
 
 from data.scierc import NUM_BIO_TAGS, NUM_RELATIONS, NO_REL_ID, BIO_TAG2ID, ID2BIO
+
+
+# ─── Phase B3: Evidence Graph Attention Layer ────────────────────────────
+
+
+class EvidenceGATLayer(nn.Module):
+    """
+    Sparse multi-head attention over an entity evidence graph (Phase B3 / ECRG).
+
+    Each entity node attends to its graph neighbors (defined by adjacency mask).
+    Pure PyTorch — no torch_geometric dependency.
+
+    Args:
+        hidden_dim: entity representation dimension (== backbone hidden_size)
+        num_heads:  number of attention heads (default: 4)
+
+    Forward:
+        x:        (N, H) — stacked entity representations
+        adj_mask: (N, N) bool — True where edge exists (including self-loops)
+
+    Returns:
+        (N, H) — enriched entity representations (residual connection applied)
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int = 4):
+        super().__init__()
+        assert hidden_dim % num_heads == 0, \
+            f"hidden_dim {hidden_dim} must be divisible by num_heads {num_heads}"
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+
+        self.q = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.k = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.out = nn.Linear(hidden_dim, hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x: torch.Tensor, adj_mask: torch.Tensor) -> torch.Tensor:
+        """
+        x:        (N, H)
+        adj_mask: (N, N) bool — True = edge exists
+        Returns:  (N, H)
+        """
+        N, H = x.shape
+        nh = self.num_heads
+        d = self.head_dim
+
+        # Project to Q, K, V and reshape to (N, num_heads, head_dim)
+        Q = self.q(x).view(N, nh, d)
+        K = self.k(x).view(N, nh, d)
+        V = self.v(x).view(N, nh, d)
+
+        # Scaled dot-product attention: (N, N, nh)
+        # attn[i,j,h] = Q[i,h] · K[j,h] / sqrt(d)
+        attn = torch.einsum("ihd,jhd->ijh", Q, K) / (d ** 0.5)
+
+        # Mask non-edges to -inf before softmax
+        if adj_mask is not None:
+            # adj_mask: (N, N) → broadcast over heads
+            attn = attn.masked_fill(~adj_mask.unsqueeze(-1), float("-inf"))
+
+        # Softmax over neighbors (dim=1 = over source nodes for each target)
+        attn = torch.softmax(attn, dim=1)  # (N, N, nh)
+
+        # Handle all-masked rows (isolated nodes — softmax → NaN)
+        attn = torch.nan_to_num(attn, nan=0.0)
+        attn = self.dropout(attn)
+
+        # Aggregate: (N, nh, d) → (N, H)
+        out = torch.einsum("ijh,jhd->ihd", attn, V).reshape(N, H)
+        out = self.out(out)
+
+        return self.norm(x + out)  # residual + layer norm
+
+
+class EvidenceGAT(nn.Module):
+    """
+    2-layer Evidence Graph Attention Network (ECRG-style, Phase B3).
+
+    Stacks two EvidenceGATLayer modules with a feed-forward projection in
+    between. Used to exchange information between entity mentions across
+    sentence boundaries.
+
+    The same adjacency mask is used for both layers (static graph).
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int = 4, num_layers: int = 2):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            EvidenceGATLayer(hidden_dim, num_heads) for _ in range(num_layers)
+        ])
+
+    def forward(self, x: torch.Tensor, adj_mask: torch.Tensor) -> torch.Tensor:
+        """
+        x:        (N, H) entity representations
+        adj_mask: (N, N) bool adjacency matrix (self-loops included)
+        Returns:  (N, H) enriched representations
+        """
+        for layer in self.layers:
+            x = layer(x, adj_mask)
+        return x
+
+
+def build_evidence_graph(entity_sentence_ids: list, n_entities: int,
+                         max_sentence_gap: int = 1) -> torch.Tensor:
+    """
+    Build adjacency matrix for the evidence graph (center-sentence heuristic).
+
+    An edge exists between entity i and entity j if they appear in the same
+    sentence OR in adjacent sentences (|sent_i - sent_j| <= max_sentence_gap).
+    Self-loops are always included.
+
+    Args:
+        entity_sentence_ids: list[int] of length N — which sentence each entity
+                             is in (0-indexed). Entities from the same sentence
+                             share the same id.
+        n_entities:          total number of entity nodes
+        max_sentence_gap:    max sentence distance to connect (default: 1 = same
+                             or adjacent sentences)
+
+    Returns:
+        adj_mask: (N, N) bool tensor (CPU) — True where edge exists
+    """
+    adj = torch.zeros(n_entities, n_entities, dtype=torch.bool)
+    sent_ids = torch.tensor(entity_sentence_ids, dtype=torch.long)
+
+    # Vectorized: |sent_i - sent_j| <= max_sentence_gap
+    diff = (sent_ids.unsqueeze(0) - sent_ids.unsqueeze(1)).abs()  # (N, N)
+    adj = diff <= max_sentence_gap  # includes self-loops (diff == 0)
+
+    return adj
 
 
 # ─── Modality adapters ──────────────────────────────────────────────────
@@ -188,6 +327,14 @@ class BertKGExtractor(nn.Module):
         # Excludes NO_REL (class 0) — only real relation types (n_rel - 1).
         # Disabled by default; enabled when --global-rel-weight > 0.
         self.global_rel_head = None  # set to nn.Linear(hidden, n_rel-1) in train_span.py
+
+        # ── Phase B3: ECRG-style Evidence GAT ─────────────────────────
+        # 2-layer sparse multi-head attention over entity mention graph.
+        # Enabled when --evidence-gat is passed to train_span.py.
+        # max_sentence_gap controls which entities are connected (default: 1
+        # = same or adjacent sentences only).
+        self.evidence_gat = None   # set to EvidenceGAT(hidden) in train_span.py
+        self.evidence_gat_gap = 1  # max sentence gap for adjacency
 
         # ── Pluggable adapters ─────────────────────────────────────────
         self.adapters = nn.ModuleDict()
@@ -493,6 +640,92 @@ class BertKGExtractor(nn.Module):
                 feats.append(torch.cat([head_vec, tail_vec], dim=-1))
         feats = torch.stack(feats, dim=0)  # (num_pairs, 2H or 3H)
         return self.re_head(self.dropout(feats))
+
+    def forward_re_with_graph(
+        self,
+        hidden_states_list: list,
+        word_ids_list: list,
+        entity_spans_by_sent: list,
+        pairs_by_sent: list,
+        entity_sent_ids: list,
+    ) -> list:
+        """
+        Phase B3: RE prediction with ECRG-style evidence graph enrichment.
+
+        Encodes entity spans from each sentence independently, stacks them
+        into a node matrix, runs EvidenceGAT, then uses enriched representations
+        for RE head predictions.
+
+        Args:
+            hidden_states_list:  list of (T_i, H) tensors — one per sentence
+            word_ids_list:       list of word_ids lists — one per sentence
+            entity_spans_by_sent: list of lists — entity spans per sentence.
+                Each element: list of (start, end_inclusive) word-level spans.
+            pairs_by_sent:       list of lists — RE pairs per sentence.
+                Each element: list of ((hs,he), (ts,te), h_node_idx, t_node_idx)
+                where h_node_idx and t_node_idx are indices into the global
+                entity node list.
+            entity_sent_ids:     list[int] — sentence id for each entity node.
+
+        Returns:
+            list of (num_pairs_in_sent, NUM_RELATIONS) tensors — one per sentence.
+            Empty list if no entities.
+
+        Notes:
+            - If evidence_gat is None (not enabled), falls back to sentence-local
+              span representations (equivalent to current forward_re behavior).
+            - entity_spans_by_sent must be non-empty for graph construction.
+        """
+        if not entity_spans_by_sent or not any(entity_spans_by_sent):
+            return []
+
+        # Step 1: Compute initial span representations for all entity nodes
+        all_span_reps = []
+        for sent_idx, (hidden_b, wids, spans) in enumerate(
+                zip(hidden_states_list, word_ids_list, entity_spans_by_sent)):
+            for span in spans:
+                all_span_reps.append(self.span_repr(hidden_b, wids, span))
+
+        if not all_span_reps:
+            return []
+
+        # Step 2: Stack into entity node matrix (N, H)
+        node_reps = torch.stack(all_span_reps, dim=0)  # (N, H)
+
+        # Step 3: Run EvidenceGAT if enabled
+        if self.evidence_gat is not None and len(node_reps) > 1:
+            adj_mask = build_evidence_graph(
+                entity_sent_ids, len(node_reps),
+                max_sentence_gap=self.evidence_gat_gap,
+            ).to(node_reps.device)
+            node_reps = self.evidence_gat(node_reps, adj_mask)
+
+        # Step 4: RE head using enriched node representations
+        results = []
+        for sent_pairs in pairs_by_sent:
+            if not sent_pairs:
+                results.append(None)
+                continue
+            feats = []
+            for (hs, he), (ts, te), h_idx, t_idx in sent_pairs:
+                head_vec = node_reps[h_idx]
+                tail_vec = node_reps[t_idx]
+                if self.re_context_span:
+                    # Use the sentence's hidden states for between-span context
+                    # Determine which sentence this pair belongs to
+                    sent_idx = entity_sent_ids[h_idx]
+                    ctx_vec = self._between_span_repr(
+                        hidden_states_list[sent_idx],
+                        word_ids_list[sent_idx],
+                        (hs, he), (ts, te),
+                    )
+                    feats.append(torch.cat([head_vec, tail_vec, ctx_vec], dim=-1))
+                else:
+                    feats.append(torch.cat([head_vec, tail_vec], dim=-1))
+            feats_t = torch.stack(feats, dim=0)
+            results.append(self.re_head(self.dropout(feats_t)))
+
+        return results
 
 
 # ─── Loss ────────────────────────────────────────────────────────────────
