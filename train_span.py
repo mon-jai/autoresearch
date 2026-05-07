@@ -1173,7 +1173,10 @@ def main():
                     best_metrics = eval_metrics
                     best_step = step
                     if args.save_best_to:
-                        torch.save(model.state_dict(), args.save_best_to)
+                        save_path = Path(args.save_best_to)
+                        save_path.parent.mkdir(parents=True, exist_ok=True)
+                        torch.save({"encoder": model.state_dict(), "step": step,
+                                    "metrics": eval_metrics}, save_path)
                 model.train()
             continue  # skip standard training path below
 
