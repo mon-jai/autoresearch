@@ -435,7 +435,8 @@ def compute_doc_loss(model, doc_batch, device, ds_mod, entity_type2id,
         if neg_sample_ratio > 0 and neg_pairs:
             n_keep = max(len(pos_pairs), int(len(neg_pairs) * neg_sample_ratio))
             n_keep = min(n_keep, len(neg_pairs))
-            neg_pairs = neg_pairs[:n_keep]  # simple truncation (shuffled at dataset level)
+            random.shuffle(neg_pairs)
+            neg_pairs = neg_pairs[:n_keep]
         kept_pairs = pos_pairs + neg_pairs
 
         sent_pairs = []
