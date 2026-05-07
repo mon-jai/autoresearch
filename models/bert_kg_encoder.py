@@ -180,6 +180,15 @@ class BertKGExtractor(nn.Module):
         self._re_n_rel = n_rel
         self._dropout_p = dropout
 
+        # ── GREP-style global relation prediction head (A13) ─────────────
+        # Predicts which relation types are present in the document as a
+        # multi-label auxiliary task over the [CLS] token representation.
+        # This forces the encoder to recognize document-level relation
+        # co-occurrence before per-pair classification.
+        # Excludes NO_REL (class 0) — only real relation types (n_rel - 1).
+        # Disabled by default; enabled when --global-rel-weight > 0.
+        self.global_rel_head = None  # set to nn.Linear(hidden, n_rel-1) in train_span.py
+
         # ── Pluggable adapters ─────────────────────────────────────────
         self.adapters = nn.ModuleDict()
         # Register the TextAdapter by default — Stage 2 only needs text.

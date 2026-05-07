@@ -165,6 +165,13 @@ def parse_args():
                         "Captures in-span evidence text directly. Works for same-sentence "
                         "pairs; returns zero vector for adjacent/overlapping spans. "
                         "Note: requires re-initializing re_head with 3H input.")
+    p.add_argument("--global-rel-weight", type=float, default=0.0,
+                   help="A13 GREP-style: Weight for global relation prediction auxiliary loss. "
+                        "0 = disabled (default). When >0, adds a document-level multi-label "
+                        "BCE auxiliary loss over the [CLS] token to predict which relation "
+                        "types are present in the sentence/batch. Forces the encoder to "
+                        "recognize relation type co-occurrence before per-pair classification. "
+                        "Recommended: 0.1-0.2 (ACL 2025 GREP used 0.1-0.3).")
     p.add_argument("--doc-window-size", type=int, default=1,
                    help="For document-aware datasets, join N consecutive sentences "
                         "from the same source document into one context window. "
@@ -308,7 +315,8 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
                       boundary_reg_weight=0.0, eer_alpha=0.0,
                       re_neg_subsample=0.0,
                       re_adv_neg=False, re_adv_temp=0.5,
-                      re_comparison_boost=1.0):
+                      re_comparison_boost=1.0,
+                      global_rel_weight=0.0):
     """Compute span NER loss + RE loss + optional BIO auxiliary loss."""
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
@@ -547,7 +555,22 @@ def compute_span_loss(model, batch, device, ds_mod, entity_type2id,
         )
     else:
         contrastive_loss = hidden.new_tensor(0.0)
-    total = ner_loss + re_weight * re_loss + cl_weight * contrastive_loss + bio_weight * bio_loss
+    # A13 GREP-style global relation prediction: multi-label BCE over [CLS] token.
+    # Predicts which relation types are present in the batch.
+    global_rel_loss = hidden.new_tensor(0.0)
+    if global_rel_weight > 0 and model.global_rel_head is not None:
+        # [CLS] token is at position 0 in the DeBERTa/BERT hidden states.
+        cls_reps = hidden[:, 0, :]  # (B, H)
+        global_logits = model.global_rel_head(cls_reps)  # (B, n_rel-1)
+        # Build multi-label targets: which relation IDs appear in each batch item
+        global_targets = hidden.new_zeros(hidden.size(0), global_logits.size(-1))
+        for b_idx, gold_rels in enumerate(gold_relations_list):
+            for (_, _, rid) in gold_rels:
+                rel_idx = rid - 1  # exclude NO_REL (0), so ID 1 → index 0
+                if 0 <= rel_idx < global_logits.size(-1):
+                    global_targets[b_idx, rel_idx] = 1.0
+        global_rel_loss = F.binary_cross_entropy_with_logits(global_logits, global_targets)
+    total = ner_loss + re_weight * re_loss + cl_weight * contrastive_loss + bio_weight * bio_loss + global_rel_weight * global_rel_loss
     if return_bio_logits:
         return total, ner_loss.detach(), re_loss.detach(), contrastive_loss.detach(), bio_loss.detach(), bio_logits
     return total, ner_loss.detach(), re_loss.detach(), contrastive_loss.detach(), bio_loss.detach()
@@ -789,6 +812,13 @@ def main():
         ).to(device)
         print(f"  re_context_span: enabled (RE head input: 3H={hidden*3})")
 
+    # A13: GREP-style global relation prediction head.
+    if args.global_rel_weight > 0:
+        hidden = model.backbone.hidden_size
+        n_rel = ds_mod.NUM_RELATIONS
+        model.global_rel_head = torch.nn.Linear(hidden, n_rel - 1).to(device)  # exclude NO_REL
+        print(f"  global_rel_head: enabled (weight={args.global_rel_weight})")
+
     # Load ELECTRA cooperative pre-training checkpoint if provided
     if args.pretrain_ckpt:
         ckpt = torch.load(args.pretrain_ckpt, map_location=device)
@@ -902,6 +932,7 @@ def main():
                 re_adv_neg=args.re_adv_neg,
                 re_adv_temp=args.re_adv_temp,
                 re_comparison_boost=args.re_comparison_boost,
+                global_rel_weight=args.global_rel_weight,
             )
             gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
                 model, batch, device, ds_mod, entity_type2id,
@@ -922,6 +953,7 @@ def main():
                 re_adv_neg=args.re_adv_neg,
                 re_adv_temp=args.re_adv_temp,
                 re_comparison_boost=args.re_comparison_boost,
+                global_rel_weight=args.global_rel_weight,
             )
             # Average the two losses + symmetric KL on BIO logits
             gold_loss = (gold_loss + gold_loss2) / 2
@@ -953,6 +985,7 @@ def main():
                 re_adv_neg=args.re_adv_neg,
                 re_adv_temp=args.re_adv_temp,
                 re_comparison_boost=args.re_comparison_boost,
+                global_rel_weight=args.global_rel_weight,
             )
 
         synth_loss_val = 0.0
