@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
-from models.bert_kg_encoder import BertKGExtractor
+from models.bert_kg_encoder import BertKGExtractor, build_evidence_graph, EvidenceGAT
 
 
 DATASET_REGISTRY = {
@@ -347,8 +347,6 @@ def compute_doc_loss(model, doc_batch, device, ds_mod, entity_type2id,
     Returns:
         (total_loss, ner_loss_detached, re_loss_detached)
     """
-    from models.bert_kg_encoder import build_evidence_graph
-
     ner_losses = []
     all_hidden = []       # (T_i, H) per sentence
     all_word_ids = []     # list of word_ids per sentence
@@ -1024,7 +1022,6 @@ def main():
 
     # Phase B3: Evidence GAT initialization.
     if args.evidence_gat:
-        from models.bert_kg_encoder import EvidenceGAT
         hidden = model.backbone.hidden_size
         model.evidence_gat = EvidenceGAT(
             hidden_dim=hidden,
