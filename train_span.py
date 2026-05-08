@@ -159,6 +159,20 @@ def parse_args():
                         "relations) and have 0%% evidence-path reachability. "
                         "Value >1.0 upweights these classes in the RE cross-entropy. "
                         "Recommended: 3.0-8.0. Default 1.0 (no boost).")
+    p.add_argument("--re-boost-end", type=float, default=0.0,
+                   help="A15 Curriculum Boost: if >0, linearly decay --re-comparison-boost "
+                        "from its start value to this end value over all training steps. "
+                        "Example: --re-comparison-boost 5.0 --re-boost-end 2.0 starts at 5x "
+                        "and decays to 2x. Default 0.0 = constant boost (disabled).")
+    p.add_argument("--re-boost-adaptive-steps", type=int, default=0,
+                   help="A16 Seed-Adaptive Boost: if >0, do a dev evaluation at this step. "
+                        "If Triple F1 exceeds --re-boost-adaptive-threshold, switch boost to "
+                        "--re-boost-end (or 1.0 if unset), otherwise keep --re-comparison-boost. "
+                        "Addresses Robin Hood: strong seeds self-reduce their boost early. Default 0.")
+    p.add_argument("--re-boost-adaptive-threshold", type=float, default=0.35,
+                   help="A16: Triple F1 threshold at --re-boost-adaptive-steps for boost switch. "
+                        "Seeds above this value at the checkpoint get lower boost for remaining training. "
+                        "Default 0.35.")
     p.add_argument("--re-context-span", action="store_true",
                    help="A12: Add mean of tokens between head and tail spans as a third "
                         "feature vector in the RE pair representation (3H instead of 2H). "
@@ -1111,6 +1125,23 @@ def main():
     if args.rdrop_weight > 0:
         print(f"  rdrop:          weight={args.rdrop_weight}")
 
+    # A15: Comparison boost curriculum: linearly decay from --re-comparison-boost to --re-boost-end
+    use_boost_curriculum = args.re_boost_end > 0 and args.re_comparison_boost > 1.0
+    if use_boost_curriculum:
+        print(f"  boost_curriculum: {args.re_comparison_boost:.1f}x → {args.re_boost_end:.1f}x over {args.max_steps} steps")
+    elif args.re_comparison_boost > 1.0:
+        print(f"  re_boost:         {args.re_comparison_boost:.1f}x (constant)")
+
+    # A16: Seed-adaptive boost: switch boost level based on early eval performance
+    use_boost_adaptive = args.re_boost_adaptive_steps > 0 and args.re_comparison_boost > 1.0
+    boost_adaptive_triggered = False  # set to True once adaptive threshold is checked
+    boost_adaptive_switched = False   # set to True if boost was switched down
+    if use_boost_adaptive:
+        low_boost = args.re_boost_end if args.re_boost_end > 0 else 1.0
+        print(f"  boost_adaptive:   eval@{args.re_boost_adaptive_steps}, "
+              f"threshold={args.re_boost_adaptive_threshold:.2f}, "
+              f"switch {args.re_comparison_boost:.1f}x→{low_boost:.1f}x if Triple F1 above threshold")
+
     model.train()
     t0 = time.time()
     step = 0
@@ -1124,6 +1155,40 @@ def main():
         else:
             bio_w_eff = args.bio_weight
 
+        # A15: Compute effective comparison boost (curriculum or constant)
+        if use_boost_curriculum:
+            boost_eff = args.re_comparison_boost - (args.re_comparison_boost - args.re_boost_end) * (step / max(args.max_steps - 1, 1))
+        else:
+            boost_eff = args.re_comparison_boost
+
+        # A16: Seed-adaptive boost — override boost_eff if threshold was crossed
+        if use_boost_adaptive and boost_adaptive_switched:
+            boost_eff = low_boost  # already evaluated and switched
+
+        # A16: Check at adaptive step (inject a dev eval if not already scheduled)
+        if use_boost_adaptive and not boost_adaptive_triggered and step == args.re_boost_adaptive_steps:
+            boost_adaptive_triggered = True
+            # Run a quick dev eval to decide whether to switch boost
+            _saved_train = model.training
+            model.eval()
+            with torch.no_grad():
+                _adap_metrics = evaluate_span(
+                    model, dev_loader, device, ds_mod,
+                    entity_type2id=entity_type2id, id2entity_type=id2entity_type,
+                    max_span_width=args.max_span_width,
+                )
+            if _saved_train:
+                model.train()
+            _adap_triple = _adap_metrics.get("triple_f1", 0.0)
+            if _adap_triple >= args.re_boost_adaptive_threshold:
+                boost_adaptive_switched = True
+                boost_eff = low_boost
+                print(f"[A16@{step}] Triple={_adap_triple:.4f} >= {args.re_boost_adaptive_threshold:.2f} → switching boost {args.re_comparison_boost:.1f}x→{low_boost:.1f}x",
+                      flush=True)
+            else:
+                print(f"[A16@{step}] Triple={_adap_triple:.4f} < {args.re_boost_adaptive_threshold:.2f} → keeping boost {args.re_comparison_boost:.1f}x",
+                      flush=True)
+
         # Phase B3: Evidence GAT document-level loss
         if args.evidence_gat:
             # doc_batch is a list of sentence dicts (one per sentence in this doc)
@@ -1133,7 +1198,7 @@ def main():
                 re_weight=args.re_weight,
                 neg_sample_ratio=args.neg_sample_ratio,
                 max_span_width=args.max_span_width,
-                re_comparison_boost=args.re_comparison_boost,
+                re_comparison_boost=boost_eff,
                 bio_weight=bio_w_eff,
             )
             cl_loss = gold_loss.new_tensor(0.0)
@@ -1202,7 +1267,7 @@ def main():
                 re_neg_subsample=args.re_neg_subsample,
                 re_adv_neg=args.re_adv_neg,
                 re_adv_temp=args.re_adv_temp,
-                re_comparison_boost=args.re_comparison_boost,
+                re_comparison_boost=boost_eff,
                 global_rel_weight=args.global_rel_weight,
             )
             gold_loss2, _, _, _, _, bio_logits2 = compute_span_loss(
@@ -1223,7 +1288,7 @@ def main():
                 re_neg_subsample=args.re_neg_subsample,
                 re_adv_neg=args.re_adv_neg,
                 re_adv_temp=args.re_adv_temp,
-                re_comparison_boost=args.re_comparison_boost,
+                re_comparison_boost=boost_eff,
                 global_rel_weight=args.global_rel_weight,
             )
             # Average the two losses + symmetric KL on BIO logits
@@ -1255,7 +1320,7 @@ def main():
                 re_neg_subsample=args.re_neg_subsample,
                 re_adv_neg=args.re_adv_neg,
                 re_adv_temp=args.re_adv_temp,
-                re_comparison_boost=args.re_comparison_boost,
+                re_comparison_boost=boost_eff,
                 global_rel_weight=args.global_rel_weight,
             )
 
