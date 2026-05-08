@@ -173,6 +173,14 @@ def parse_args():
                    help="A16: Triple F1 threshold at --re-boost-adaptive-steps for boost switch. "
                         "Seeds above this value at the checkpoint get lower boost for remaining training. "
                         "Default 0.35.")
+    p.add_argument("--re-head-finetune-steps", type=int, default=0,
+                   help="A17 Two-Stage: if >0, freeze backbone and switch to --re-head-finetune-boost "
+                        "for the last N training steps. Separates encoder learning from RE head "
+                        "calibration for rare comparison relations. Default 0 = disabled.")
+    p.add_argument("--re-head-finetune-boost", type=float, default=10.0,
+                   help="A17: Comparison boost to apply during RE head fine-tuning phase. "
+                        "Used only when --re-head-finetune-steps > 0 and we enter the finetune stage. "
+                        "Should be much higher than --re-comparison-boost (e.g., 10.0). Default 10.0.")
     p.add_argument("--re-context-span", action="store_true",
                    help="A12: Add mean of tokens between head and tail spans as a third "
                         "feature vector in the RE pair representation (3H instead of 2H). "
@@ -1142,6 +1150,14 @@ def main():
               f"threshold={args.re_boost_adaptive_threshold:.2f}, "
               f"switch {args.re_comparison_boost:.1f}x→{low_boost:.1f}x if Triple F1 above threshold")
 
+    # A17: Two-stage RE head fine-tuning: freeze encoder and use high boost for last N steps
+    use_re_head_finetune = args.re_head_finetune_steps > 0
+    re_head_finetune_active = False  # set to True when we enter the fine-tuning stage
+    re_head_finetune_start = args.max_steps - args.re_head_finetune_steps
+    if use_re_head_finetune:
+        print(f"  re_head_finetune: freeze backbone at step {re_head_finetune_start}, "
+              f"boost→{args.re_head_finetune_boost:.1f}x for last {args.re_head_finetune_steps} steps")
+
     model.train()
     t0 = time.time()
     step = 0
@@ -1188,6 +1204,18 @@ def main():
             else:
                 print(f"[A16@{step}] Triple={_adap_triple:.4f} < {args.re_boost_adaptive_threshold:.2f} → keeping boost {args.re_comparison_boost:.1f}x",
                       flush=True)
+
+        # A17: Two-stage RE head fine-tuning — freeze backbone, override boost
+        if use_re_head_finetune and not re_head_finetune_active and step >= re_head_finetune_start:
+            re_head_finetune_active = True
+            # Freeze backbone: set requires_grad=False for all non-RE-head params
+            for name, param in model.named_parameters():
+                if not name.startswith("re_head"):
+                    param.requires_grad_(False)
+            print(f"[A17@{step}] Entering RE head fine-tune: backbone frozen, boost→{args.re_head_finetune_boost:.1f}x",
+                  flush=True)
+        if re_head_finetune_active:
+            boost_eff = args.re_head_finetune_boost
 
         # Phase B3: Evidence GAT document-level loss
         if args.evidence_gat:
