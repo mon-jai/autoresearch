@@ -164,6 +164,11 @@ def parse_args():
                         "from its start value to this end value over all training steps. "
                         "Example: --re-comparison-boost 5.0 --re-boost-end 2.0 starts at 5x "
                         "and decays to 2x. Default 0.0 = constant boost (disabled).")
+    p.add_argument("--re-boost-decay-cosine", action="store_true",
+                   help="A19 Cosine Curriculum: use cosine decay schedule for --re-boost-end "
+                        "instead of linear decay. Cosine is slower initially and faster near "
+                        "the end, better preserving early-phase comparison-relation signal. "
+                        "Requires --re-boost-end >0 to activate. Default: linear decay.")
     p.add_argument("--re-boost-adaptive-steps", type=int, default=0,
                    help="A16 Seed-Adaptive Boost: if >0, do a dev evaluation at this step. "
                         "If Triple F1 exceeds --re-boost-adaptive-threshold, switch boost to "
@@ -1133,10 +1138,11 @@ def main():
     if args.rdrop_weight > 0:
         print(f"  rdrop:          weight={args.rdrop_weight}")
 
-    # A15: Comparison boost curriculum: linearly decay from --re-comparison-boost to --re-boost-end
+    # A15/A19: Comparison boost curriculum: decay from --re-comparison-boost to --re-boost-end
     use_boost_curriculum = args.re_boost_end > 0 and args.re_comparison_boost > 1.0
     if use_boost_curriculum:
-        print(f"  boost_curriculum: {args.re_comparison_boost:.1f}x → {args.re_boost_end:.1f}x over {args.max_steps} steps")
+        _decay_type = "cosine" if args.re_boost_decay_cosine else "linear"
+        print(f"  boost_curriculum: {args.re_comparison_boost:.1f}x → {args.re_boost_end:.1f}x over {args.max_steps} steps ({_decay_type} decay)")
     elif args.re_comparison_boost > 1.0:
         print(f"  re_boost:         {args.re_comparison_boost:.1f}x (constant)")
 
@@ -1171,9 +1177,15 @@ def main():
         else:
             bio_w_eff = args.bio_weight
 
-        # A15: Compute effective comparison boost (curriculum or constant)
+        # A15/A19: Compute effective comparison boost (curriculum or constant)
         if use_boost_curriculum:
-            boost_eff = args.re_comparison_boost - (args.re_comparison_boost - args.re_boost_end) * (step / max(args.max_steps - 1, 1))
+            progress = step / max(args.max_steps - 1, 1)
+            if args.re_boost_decay_cosine:
+                import math as _math
+                decay_factor = (1 - _math.cos(_math.pi * progress)) / 2
+            else:
+                decay_factor = progress
+            boost_eff = args.re_comparison_boost - (args.re_comparison_boost - args.re_boost_end) * decay_factor
         else:
             boost_eff = args.re_comparison_boost
 
