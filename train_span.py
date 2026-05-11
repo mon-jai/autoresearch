@@ -105,9 +105,9 @@ def parse_args():
                         "0 = disabled. When >0, negative spans overlapping gold "
                         "entities get loss weighted by (1 + iou_neg_weight * IoU). "
                         "SpERT.MT (2023) shows +2.88% RE on SciERC with IoU scaling.")
-    p.add_argument("--label-smoothing", type=float, default=0.0,
+    p.add_argument("--label-smoothing", type=float, default=0.1,
                    help="Label smoothing for NER focal loss. 0 = disabled. "
-                        "0.05-0.1 recommended. Prevents overconfident predictions "
+                        "0.1 recommended for A21. Prevents overconfident predictions "
                         "on hard boundary negatives.")
     p.add_argument("--re-focal-gamma", type=float, default=0.0,
                    help="Focal loss gamma for RE head. 0 = standard CE (default). "
@@ -173,11 +173,13 @@ def parse_args():
                    help="A16 Seed-Adaptive Boost: if >0, do a dev evaluation at this step. "
                         "If Triple F1 exceeds --re-boost-adaptive-threshold, switch boost to "
                         "--re-boost-end (or 1.0 if unset), otherwise keep --re-comparison-boost. "
-                        "Addresses Robin Hood: strong seeds self-reduce their boost early. Default 0.")
+                        "Addresses Robin Hood: strong seeds self-reduce their boost early.")
     p.add_argument("--re-boost-adaptive-threshold", type=float, default=0.35,
-                   help="A16: Triple F1 threshold at --re-boost-adaptive-steps for boost switch. "
-                        "Seeds above this value at the checkpoint get lower boost for remaining training. "
-                        "Default 0.35.")
+                   help="A16/A20: First Triple F1 threshold for boost switch. Default 0.35.")
+    p.add_argument("--re-boost-adaptive-threshold2", type=float, default=0.40,
+                   help="A20: Second Triple F1 threshold for staircase boost switch. Default 0.40.")
+    p.add_argument("--re-boost-mid", type=float, default=3.5,
+                   help="A20: Intermediate boost level for staircase adaptive boost. Default 3.5.")
     p.add_argument("--re-head-finetune-steps", type=int, default=0,
                    help="A17 Two-Stage: if >0, freeze backbone and switch to --re-head-finetune-boost "
                         "for the last N training steps. Separates encoder learning from RE head "
@@ -961,7 +963,10 @@ def main():
     print(f"  max_span_width: {args.max_span_width}")
     print(f"  neg_sample:     {args.neg_sample_ratio}")
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    tokenizer_kwargs = {}
+    if "deberta" in args.model_name.lower():
+        tokenizer_kwargs["add_prefix_space"] = True
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, **tokenizer_kwargs)
     # Pass seed to build_dataloaders for datasets that create dev split at runtime
     # (CODE-ACCORD, CUAD). Datasets with fixed splits (SciERC, SciER, CoNLL04, ADE)
     # ignore the seed kwarg. This ensures each seed gets its own train/dev split,
@@ -1152,9 +1157,10 @@ def main():
     boost_adaptive_switched = False   # set to True if boost was switched down
     if use_boost_adaptive:
         low_boost = args.re_boost_end if args.re_boost_end > 0 else 1.0
+        mid_boost = args.re_boost_mid
         print(f"  boost_adaptive:   eval@{args.re_boost_adaptive_steps}, "
-              f"threshold={args.re_boost_adaptive_threshold:.2f}, "
-              f"switch {args.re_comparison_boost:.1f}x→{low_boost:.1f}x if Triple F1 above threshold")
+              f"T1={args.re_boost_adaptive_threshold:.2f}→{mid_boost:.1f}x, "
+              f"T2={args.re_boost_adaptive_threshold2:.2f}→{low_boost:.1f}x")
 
     # A17: Two-stage RE head fine-tuning: freeze encoder and use high boost for last N steps
     use_re_head_finetune = args.re_head_finetune_steps > 0
@@ -1208,21 +1214,28 @@ def main():
             if _saved_train:
                 model.train()
             _adap_triple = _adap_metrics.get("triple_f1", 0.0)
-            if _adap_triple >= args.re_boost_adaptive_threshold:
+            if _adap_triple >= args.re_boost_adaptive_threshold2:
                 boost_adaptive_switched = True
                 boost_eff = low_boost
-                print(f"[A16@{step}] Triple={_adap_triple:.4f} >= {args.re_boost_adaptive_threshold:.2f} → switching boost {args.re_comparison_boost:.1f}x→{low_boost:.1f}x",
+                print(f"[A20@{step}] Triple={_adap_triple:.4f} >= {args.re_boost_adaptive_threshold2:.2f} → Staircase switch {args.re_comparison_boost:.1f}x→{low_boost:.1f}x",
+                      flush=True)
+            elif _adap_triple >= args.re_boost_adaptive_threshold:
+                boost_adaptive_switched = True
+                boost_eff = mid_boost
+                print(f"[A20@{step}] Triple={_adap_triple:.4f} >= {args.re_boost_adaptive_threshold:.2f} → Staircase switch {args.re_comparison_boost:.1f}x→{mid_boost:.1f}x",
                       flush=True)
             else:
-                print(f"[A16@{step}] Triple={_adap_triple:.4f} < {args.re_boost_adaptive_threshold:.2f} → keeping boost {args.re_comparison_boost:.1f}x",
+                print(f"[A20@{step}] Triple={_adap_triple:.4f} < {args.re_boost_adaptive_threshold:.2f} → keeping boost {args.re_comparison_boost:.1f}x",
                       flush=True)
 
         # A17: Two-stage RE head fine-tuning — freeze backbone, override boost
         if use_re_head_finetune and not re_head_finetune_active and step >= re_head_finetune_start:
             re_head_finetune_active = True
-            # Freeze backbone: set requires_grad=False for all non-RE-head params
+            # Freeze only the shared transformer backbone. Keep task heads and
+            # EvidenceGAT trainable so doc batches without RE pairs still have
+            # a differentiable NER/GAT/head loss during the final phase.
             for name, param in model.named_parameters():
-                if not name.startswith("re_head"):
+                if name.startswith("backbone."):
                     param.requires_grad_(False)
             print(f"[A17@{step}] Entering RE head fine-tune: backbone frozen, boost→{args.re_head_finetune_boost:.1f}x",
                   flush=True)
