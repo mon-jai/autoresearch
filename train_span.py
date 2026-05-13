@@ -60,6 +60,8 @@ def parse_args():
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save-best-to", default=None)
+    p.add_argument("--primary-metric", default="triple_f1", choices=["triple_f1", "ner_f1"],
+                   help="Metric used to determine best checkpoint. Use ner_f1 for CUAD pretraining.")
     p.add_argument("--synth-jsonl", default="",
                    help="Path to synth/cycle JSONL. Empty = gold only. "
                         "Used for both CAST pseudo-labels and CycleGT round-trip data.")
@@ -1125,7 +1127,7 @@ def main():
 
     gold_iter = cycle(train_loader)
     synth_iter = cycle(synth_loader) if synth_loader else None
-    best_metrics = {"triple_f1": -1.0}
+    best_metrics = {args.primary_metric: -1.0}
     best_step = -1
 
     use_cl = args.cl_weight > 0
@@ -1286,9 +1288,9 @@ def main():
                 triple_f1 = eval_metrics.get("triple_f1", 0.0)
                 ner_f1 = eval_metrics.get("ner_f1", 0.0)
                 print(f"[Eval @ {step}] NER={ner_f1:.4f} Triple={triple_f1:.4f} "
-                      f"{'*' if triple_f1 > best_metrics['triple_f1'] else ''}",
+                      f"{'*' if eval_metrics.get(args.primary_metric, 0.0) > best_metrics[args.primary_metric] else ''}",
                       flush=True)
-                if triple_f1 > best_metrics["triple_f1"]:
+                if eval_metrics.get(args.primary_metric, 0.0) > best_metrics[args.primary_metric]:
                     best_metrics = eval_metrics
                     best_step = step
                     if args.save_best_to:
@@ -1432,7 +1434,7 @@ def main():
                 span_proposal_expand=args.span_proposal_expand,
             )
             star = ""
-            if metrics["triple_f1"] > best_metrics["triple_f1"]:
+            if metrics.get(args.primary_metric, 0.0) > best_metrics[args.primary_metric]:
                 best_metrics = dict(metrics)
                 best_step = step
                 star = " *"
@@ -1459,7 +1461,7 @@ def main():
             span_proposal=args.span_proposal,
             span_proposal_expand=args.span_proposal_expand,
         )
-        if split_name == "dev" and metrics["triple_f1"] > best_metrics["triple_f1"]:
+        if split_name == "dev" and metrics.get(args.primary_metric, 0.0) > best_metrics[args.primary_metric]:
             best_metrics = dict(metrics)
             best_step = step
         msg = (f"\n=== {split_name.upper()} (step {step}) ===\n"
