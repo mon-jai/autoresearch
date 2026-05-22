@@ -39,6 +39,8 @@ def parse_args():
                         "Stage 2-005 default: 100. Stage 2-001..004 used 0.")
     p.add_argument("--re-weight", type=float, default=1.0)
     p.add_argument("--eval-every", type=int, default=50)
+    p.add_argument("--dataset", default="scierc",
+                   help="Dataset name (accepted for pipeline compatibility; only 'scierc' is supported).")
     p.add_argument("--data-dir", default=None, help="Path to SciERC json files")
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=42)
@@ -121,7 +123,7 @@ def main():
             if metrics["triple_f1"] > best_metrics["triple_f1"]:
                 best_metrics = dict(metrics)
                 best_step = step
-                star = " ★ NEW BEST"
+                star = " * NEW BEST"
                 if args.save_best_to:
                     save_path = Path(args.save_best_to)
                     save_path.parent.mkdir(parents=True, exist_ok=True)

@@ -242,11 +242,13 @@ def main():
     # Also patch data.scierc dicts in-place so that triple_f1's decode
     # functions (which import ID2BIO at module level) use the right tags.
     import data.scierc as scierc_mod
+    _new_id2bio = dict(ds_mod.ID2BIO)
+    _new_bio_tag2id = dict(ds_mod.BIO_TAG2ID)
     scierc_mod.NO_REL_ID = ds_mod.NO_REL_ID
     scierc_mod.ID2BIO.clear()
-    scierc_mod.ID2BIO.update(ds_mod.ID2BIO)
+    scierc_mod.ID2BIO.update(_new_id2bio)
     scierc_mod.BIO_TAG2ID.clear()
-    scierc_mod.BIO_TAG2ID.update(ds_mod.BIO_TAG2ID)
+    scierc_mod.BIO_TAG2ID.update(_new_bio_tag2id)
     model = BertKGExtractor(
         args.model_name,
         num_bio_tags=ds_mod.NUM_BIO_TAGS,

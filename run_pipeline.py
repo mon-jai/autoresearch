@@ -28,6 +28,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Prefer the venv Python (has torch/transformers) over the invoking interpreter.
+_VENV_PY_WIN = Path(__file__).parent / ".venv" / "Scripts" / "python.exe"
+_VENV_PY_UNIX = Path(__file__).parent / ".venv" / "bin" / "python"
+_PYTHON = (
+    str(_VENV_PY_WIN) if _VENV_PY_WIN.exists() else
+    str(_VENV_PY_UNIX) if _VENV_PY_UNIX.exists() else
+    sys.executable
+)
+
 
 # ── A20+A21+A12 production baseline flags (Phase A+) ─────────────────────────
 # Source: scripts/run_train_accord.sh
@@ -225,18 +234,21 @@ def artifact_paths(attempt: str, seed: int) -> dict:
 # ── Command helpers ───────────────────────────────────────────────────────────
 
 def _py(*args):
-    return [sys.executable] + [str(a) for a in args]
+    return [_PYTHON] + [str(a) for a in args]
 
 
 def _py_mod(module, *args):
-    return [sys.executable, "-m", module] + [str(a) for a in args]
+    return [_PYTHON, "-m", module] + [str(a) for a in args]
 
 
 def run_cmd(cmd: list, dry_run: bool = False) -> int:
     print(f"\n$ {' '.join(str(c) for c in cmd)}")
     if dry_run:
         return 0
-    return subprocess.run(cmd).returncode
+    import os
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    return subprocess.run(cmd, env=env).returncode
 
 
 # ── Pipeline steps ────────────────────────────────────────────────────────────

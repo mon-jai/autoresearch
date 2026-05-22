@@ -34,6 +34,72 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
+
+def _bio_decode_example(ner_logits_b, word_ids_b, id2bio, bio_tag2id):
+    """Decode per-example BIO token logits to entity spans.
+
+    Returns list of {"span": [s, e], "type": etype, "confidence": conf}.
+    """
+    O_id = bio_tag2id.get("O", 0)
+    seen = set()
+    word_emissions = {}
+    for i, wid in enumerate(word_ids_b):
+        if wid is None or wid in seen:
+            continue
+        word_emissions[wid] = ner_logits_b[i]
+        seen.add(wid)
+    if not word_emissions:
+        return []
+    max_wid = max(word_emissions.keys())
+    word_logits = [word_emissions.get(w, ner_logits_b[0] * 0) for w in range(max_wid + 1)]
+
+    # BIO-constrained greedy decode
+    def _valid(prev, cand):
+        ct = id2bio.get(cand, "O")
+        if ct == "O" or ct.startswith("B-"):
+            return True
+        pt = id2bio.get(prev, "O")
+        return pt == f"B-{ct[2:]}" or pt == f"I-{ct[2:]}"
+
+    bio_ids = []
+    prev = O_id
+    probs_list = []
+    for emission in word_logits:
+        probs = torch.softmax(emission, dim=-1)
+        ranked = torch.argsort(probs, descending=True).tolist()
+        chosen = O_id
+        for cand in ranked:
+            if _valid(prev, cand):
+                chosen = cand
+                break
+        bio_ids.append(chosen)
+        probs_list.append(probs[chosen].item())
+        prev = chosen
+
+    # Decode BIO spans
+    spans = []
+    cur_start = cur_type = None
+    for i, tid in enumerate(bio_ids):
+        tag = id2bio.get(tid, "O")
+        if tag == "O":
+            if cur_start is not None:
+                spans.append((cur_start, i - 1, cur_type, probs_list[cur_start]))
+                cur_start = cur_type = None
+        elif tag.startswith("B-"):
+            if cur_start is not None:
+                spans.append((cur_start, i - 1, cur_type, probs_list[cur_start]))
+            cur_start, cur_type = i, tag[2:]
+        elif tag.startswith("I-"):
+            if cur_start is None:
+                cur_start, cur_type = i, tag[2:]
+    if cur_start is not None:
+        spans.append((cur_start, len(bio_ids) - 1, cur_type, probs_list[cur_start]))
+
+    return [
+        {"span": [s, e], "type": etype, "confidence": round(conf, 4)}
+        for s, e, etype, conf in spans
+    ]
+
 from models.bert_kg_encoder import BertKGExtractor
 
 
@@ -153,6 +219,8 @@ def main():
     NO_REL = ds_mod.NO_REL_ID
     id2entity = {i + 1: t for i, t in enumerate(ds_mod.ENTITY_TYPES)}
     id2rel = ds_mod.ID2REL
+    id2bio = getattr(ds_mod, "ID2BIO", {})
+    bio_tag2id = getattr(ds_mod, "BIO_TAG2ID", {})
 
     out_path = Path(args.out_jsonl)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -177,6 +245,8 @@ def main():
                 hidden = model.encode(
                     modality="text", input_ids=input_ids, attention_mask=attention_mask,
                 )
+                # BIO models: compute NER logits once per batch.
+                bio_ner_logits = None if use_span_ner else model.forward_ner(hidden)
 
             for b_idx in range(input_ids.size(0)):
                 n_words = num_words_list[b_idx]
@@ -184,41 +254,48 @@ def main():
                 source_doc_id = doc_ids[b_idx] if doc_ids[b_idx] else doc_id
                 source_example_id = example_ids[b_idx] if example_ids[b_idx] else str(doc_id)
 
-                with torch.no_grad():
-                    span_logits, candidates = model.forward_span_ner(
-                        hidden[b_idx], word_ids_list[b_idx], n_words, max_span_width,
+                if use_span_ner:
+                    with torch.no_grad():
+                        span_logits, candidates = model.forward_span_ner(
+                            hidden[b_idx], word_ids_list[b_idx], n_words, max_span_width,
+                        )
+
+                    if not candidates:
+                        doc_id += 1
+                        continue
+
+                    # NER predictions with confidence
+                    span_probs = torch.softmax(span_logits, dim=-1)
+                    pred_types = span_logits.argmax(dim=-1).tolist()
+                    pred_confs = span_probs.max(dim=-1).values.tolist()
+
+                    # Filter and deduplicate
+                    pred_entities = []
+                    for (s, e), etype_id, conf in zip(candidates, pred_types, pred_confs):
+                        if etype_id > 0 and conf >= args.span_threshold:
+                            pred_entities.append({
+                                "span": [s, e],
+                                "type": id2entity.get(etype_id, "Unknown"),
+                                "confidence": round(conf, 4),
+                            })
+
+                    # Greedy non-overlapping (highest confidence first)
+                    pred_entities.sort(key=lambda x: -x["confidence"])
+                    taken = set()
+                    filtered_entities = []
+                    for ent in pred_entities:
+                        s, e = ent["span"]
+                        overlap = any(not (e < ts or te < s) for (ts, te) in taken)
+                        if not overlap:
+                            filtered_entities.append(ent)
+                            taken.add((s, e))
+                    pred_entities = filtered_entities
+                else:
+                    # BIO model: decode token-level BIO logits to entity spans.
+                    pred_entities = _bio_decode_example(
+                        bio_ner_logits[b_idx], word_ids_list[b_idx],
+                        id2bio, bio_tag2id,
                     )
-
-                if not candidates:
-                    doc_id += 1
-                    continue
-
-                # NER predictions with confidence
-                span_probs = torch.softmax(span_logits, dim=-1)
-                pred_types = span_logits.argmax(dim=-1).tolist()
-                pred_confs = span_probs.max(dim=-1).values.tolist()
-
-                # Filter and deduplicate
-                pred_entities = []
-                for (s, e), etype_id, conf in zip(candidates, pred_types, pred_confs):
-                    if etype_id > 0 and conf >= args.span_threshold:
-                        pred_entities.append({
-                            "span": [s, e],
-                            "type": id2entity.get(etype_id, "Unknown"),
-                            "confidence": round(conf, 4),
-                        })
-
-                # Greedy non-overlapping (highest confidence first)
-                pred_entities.sort(key=lambda x: -x["confidence"])
-                taken = set()
-                filtered_entities = []
-                for ent in pred_entities:
-                    s, e = ent["span"]
-                    overlap = any(not (e < ts or te < s) for (ts, te) in taken)
-                    if not overlap:
-                        filtered_entities.append(ent)
-                        taken.add((s, e))
-                pred_entities = filtered_entities
 
                 gold_ents = gold_entities_list[b_idx] if gold_entities_list[b_idx] is not None else []
                 if args.use_gold_entities and gold_ents:
