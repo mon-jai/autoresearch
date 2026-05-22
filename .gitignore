@@ -21,3 +21,9 @@ dev/
 
 # Results file
 results.tsv
+
+checkpoints/
+data/code_accord/**/*.csv
+data/**/*.json
+data/**/*.jsonl
+train_progress.txt
