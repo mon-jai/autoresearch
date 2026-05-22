@@ -73,13 +73,19 @@ Default `--steps`: `train,infer,build,triple,compare`
 
 ```
 checkpoints/{train_script}_{attempt}_s{seed}_best.pt
+checkpoints/{train_script}_{attempt}_s{seed}_n{max_steps}_best.pt  # when --max-steps is set
 
-results/kg_{attempt}_s{seed}_inference.jsonl   # raw predicted + gold triples
-results/kg_{attempt}_s{seed}_verified.jsonl    # after LLM verification
-results/kg_{attempt}_s{seed}.json              # built KG graph
-results/graph_rag_{attempt}_s{seed}.json       # RAG evaluation results
-results/kg_compare_{attempt}_s{seed}.json      # triple overlap F1 scores
+results/kg_{attempt}_s{seed}_inference.jsonl      # raw predicted + gold triples
+results/kg_{attempt}_s{seed}_verified.jsonl       # after LLM verification
+results/kg_{attempt}_s{seed}.json                 # built KG graph
+results/graph_rag_{attempt}_s{seed}.json          # RAG evaluation results
+results/kg_compare_{attempt}_s{seed}.json         # triple overlap F1 scores
+results/triple_eval_{attempt}_s{seed}.json        # NER F1 + Triple F1 from eval step
+results/pipeline_results.csv                      # unified table (all attempts × seeds)
 ```
+
+The `_n{max_steps}` suffix is appended to all paths when `--max-steps` is passed,
+preventing smoke-test runs (e.g. `--max-steps 2`) from overwriting production checkpoints.
 
 Examples:
 ```
@@ -87,6 +93,12 @@ checkpoints/train_span_span_accord_deberta_aplus_s42_best.pt
 results/kg_span_accord_deberta_aplus_s42_inference.jsonl
 results/kg_span_accord_deberta_aplus_s42.json
 results/kg_compare_span_accord_deberta_aplus_s42.json
+results/triple_eval_span_accord_deberta_aplus_s42.json
+results/pipeline_results.csv
+
+# Smoke-test artifacts (--max-steps 2):
+checkpoints/train_span_span_accord_deberta_aplus_s42_n2_best.pt
+results/kg_span_accord_deberta_aplus_s42_n2_inference.jsonl
 ```
 
 ---
@@ -135,6 +147,56 @@ export TORCH_CUDA_ARCH_LIST=9.0
 Use the `scripts/run_train_accord.sh` and `scripts/run_train_cuad.sh` wrappers for remote DGX runs — they inject these env vars automatically.
 
 `run_pipeline.py` is designed for local runs where CUDA_VISIBLE_DEVICES and env vars are pre-set in the shell.
+
+---
+
+## Understanding Triple F1 results
+
+### Smoke-test results are expected to be near zero
+
+When running with `--max-steps 1` or `--max-steps 2` for smoke testing, the model
+is essentially random (untrained), so Triple F1 will be ~0.000–0.001. This is expected
+and correct — the smoke tests verify that code paths execute without errors, not that
+the model produces good predictions.
+
+### Production targets
+
+| Attempt | Steps | Target Triple F1 (dev) | Notes |
+|---|---|---|---|
+| `span_accord_deberta_aplus` | 3500 | 0.4097 ± 0.036 | Phase A+ best (8 seeds) |
+| `span_accord_deberta_phase_b` | 3500 | ~0.4097 with ±std −42% | Phase B best |
+| `span_scierc_scibert_bio` | 3000 | ~0.55 (SciERC) | Standard benchmark |
+
+### Typical F1 breakdown for Phase A+ (dev split)
+
+- **NER F1**: ~0.60–0.65 — span boundary detection
+- **RE F1** (gold spans): ~0.50–0.55 — relation classification given correct spans
+- **Triple F1** (full pipeline): ~0.40–0.42 — combined; lower than RE F1 because span
+  errors compound with relation errors
+
+### Low test F1 vs dev F1
+
+Test F1 is typically 5–10 points lower than dev F1 on ACCORD. This is expected:
+the ACCORD dataset is small (~300 documents), and the model slightly overfits the dev
+distribution. Evaluate the dev metric for model selection; report test for final scores.
+
+---
+
+## Unified results CSV
+
+After any run that includes a `triple`, `rag`, or `compare` step, the pipeline appends
+or updates a row in `results/pipeline_results.csv`:
+
+| Column | Source |
+|---|---|
+| `attempt`, `seed`, `max_steps` | run parameters |
+| `timestamp` | wall clock at pipeline end |
+| `ner_f1`, `re_f1`, `triple_f1` | `results/triple_eval_*.json` |
+| `triple_overlap_p/r/f1` | `results/kg_compare_*.json` |
+| `rag_accuracy` | `results/graph_rag_*.json` (requires Ollama) |
+
+Rows are upserted by `(attempt, seed, max_steps)` key — re-running a step updates
+existing columns rather than creating duplicate rows.
 
 ---
 

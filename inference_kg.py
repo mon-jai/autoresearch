@@ -109,6 +109,7 @@ DATASET_REGISTRY = {
     "conll04": "data.conll04",
     "ade": "data.ade",
     "accord": "data.code_accord",
+    "cuad": "data.cuad",
 }
 
 
@@ -146,7 +147,8 @@ def main():
             "scier": "allenai/scibert_scivocab_uncased",
             "conll04": "bert-base-uncased",
             "ade": "allenai/scibert_scivocab_uncased",
-            "accord": "allenai/scibert_scivocab_uncased",
+            "accord": "bert-base-uncased",
+            "cuad": "microsoft/deberta-large",
         }.get(args.dataset, "bert-base-uncased")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
@@ -207,7 +209,9 @@ def main():
         ).to(device)
         model.re_context_span = True
 
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    model_keys = set(model.state_dict().keys())
+    filtered_state = {k: v for k, v in state.items() if k in model_keys}
+    missing, _ = model.load_state_dict(filtered_state, strict=False)
     if missing:
         print(f"  [warn] missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
     model.eval()

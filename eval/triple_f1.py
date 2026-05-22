@@ -284,6 +284,7 @@ def main():
     p.add_argument("--device", default=None)
     p.add_argument("--span-threshold", type=float, default=0.5,
                    help="NER confidence threshold (span models only)")
+    p.add_argument("--out-json", default=None, help="Write metrics dict as JSON to this path.")
     args = p.parse_args()
 
     _DATASET_REGISTRY = {
@@ -342,7 +343,9 @@ def main():
             num_bio_tags=ds_mod.NUM_BIO_TAGS,
             num_relations=ds_mod.NUM_RELATIONS,
         ).to(device)
-        missing, unexpected = model.load_state_dict(state, strict=False)
+        model_keys = set(model.state_dict().keys())
+        filtered_state = {k: v for k, v in state.items() if k in model_keys}
+        missing, _ = model.load_state_dict(filtered_state, strict=False)
         if missing:
             print(f"  [warn] missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
         model.eval()
@@ -351,6 +354,14 @@ def main():
         print(f"\n{args.split.upper()} NER F1={metrics['ner_f1']:.4f}  "
               f"RE F1={metrics['re_f1']:.4f}  "
               f"Triple F1={metrics['triple_f1']:.4f}")
+
+    if args.out_json:
+        import json as _json
+        from pathlib import Path as _Path
+        _out = _Path(args.out_json)
+        _out.parent.mkdir(parents=True, exist_ok=True)
+        with open(_out, "w") as _f:
+            _json.dump(metrics, _f, indent=2)
     return 0
 
 

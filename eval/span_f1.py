@@ -233,11 +233,11 @@ def load_span_model(checkpoint_path: str, model_name: str, ds_mod, device):
             nn.Linear(h * 3, h), nn.GELU(), nn.Dropout(0.1), nn.Linear(h, n_rel)
         ).to(device)
 
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    model_keys = set(model.state_dict().keys())
+    filtered_state = {k: v for k, v in state.items() if k in model_keys}
+    missing, _ = model.load_state_dict(filtered_state, strict=False)
     if missing:
         print(f"  [warn] missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
-    if unexpected:
-        print(f"  [warn] unexpected keys: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
     model.eval()
 
     entity_type2id = {t: i + 1 for i, t in enumerate(ds_mod.ENTITY_TYPES)}
@@ -260,6 +260,7 @@ def main():
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--max-length", type=int, default=128)
     p.add_argument("--device", default=None)
+    p.add_argument("--out-json", default=None, help="Write metrics dict as JSON to this path.")
     args = p.parse_args()
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -291,6 +292,12 @@ def main():
     )
     print(f"\n{args.split.upper()} NER F1={metrics['ner_f1']:.4f}  "
           f"Triple F1={metrics['triple_f1']:.4f}")
+    if args.out_json:
+        import json
+        out = Path(args.out_json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w") as _f:
+            json.dump(metrics, _f, indent=2)
     return 0
 
 

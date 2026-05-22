@@ -23,6 +23,8 @@ Usage:
         --ollama-url http://localhost:11434
 """
 import argparse
+import csv
+import datetime
 import json
 import subprocess
 import sys
@@ -215,19 +217,22 @@ EXPERIMENT_CONFIGS = {
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
 
-def checkpoint_path(attempt: str, seed: int) -> Path:
+def checkpoint_path(attempt: str, seed: int, max_steps=None) -> Path:
     cfg = EXPERIMENT_CONFIGS[attempt]
-    return Path(f"checkpoints/{cfg['train_script']}_{attempt}_s{seed}_best.pt")
+    suffix = f"_n{max_steps}" if max_steps is not None else ""
+    return Path(f"checkpoints/{cfg['train_script']}_{attempt}_s{seed}{suffix}_best.pt")
 
 
-def artifact_paths(attempt: str, seed: int) -> dict:
-    base = f"{attempt}_s{seed}"
+def artifact_paths(attempt: str, seed: int, max_steps=None) -> dict:
+    suffix = f"_n{max_steps}" if max_steps is not None else ""
+    base = f"{attempt}_s{seed}{suffix}"
     return {
-        "inference": Path(f"results/kg_{base}_inference.jsonl"),
-        "verified":  Path(f"results/kg_{base}_verified.jsonl"),
-        "kg":        Path(f"results/kg_{base}.json"),
-        "rag":       Path(f"results/graph_rag_{base}.json"),
-        "compare":   Path(f"results/kg_compare_{base}.json"),
+        "inference":   Path(f"results/kg_{base}_inference.jsonl"),
+        "verified":    Path(f"results/kg_{base}_verified.jsonl"),
+        "kg":          Path(f"results/kg_{base}.json"),
+        "rag":         Path(f"results/graph_rag_{base}.json"),
+        "compare":     Path(f"results/kg_compare_{base}.json"),
+        "triple_eval": Path(f"results/triple_eval_{base}.json"),
     }
 
 
@@ -283,7 +288,7 @@ def step_train(cfg, attempt, seed, checkpoint, dry_run, device, max_steps_overri
 
     if "requires_pretrain" in cfg:
         pretrain_name = cfg["requires_pretrain"]
-        pretrain_ckpt = checkpoint_path(pretrain_name, seed)
+        pretrain_ckpt = checkpoint_path(pretrain_name, seed, max_steps_override)
         if not dry_run and not pretrain_ckpt.exists():
             print(f"[error] Phase B requires pretrain checkpoint: {pretrain_ckpt}")
             print(f"  Run --attempt {pretrain_name} --seed {seed} first.")
@@ -327,9 +332,13 @@ def step_build_kg(artifacts, dry_run, use_verified=False):
     """5b.3: Build the KG graph JSON from triples."""
     inp = artifacts["verified"] if (use_verified and artifacts["verified"].exists()) \
         else artifacts["inference"]
+    # Use "confidence" filter when no LLM verify ran (default "verified" would
+    # silently produce an empty KG because llm_verdict is absent from the JSONL).
+    filter_mode = "verified" if use_verified else "confidence"
     args = [
         "--input", str(inp),
         "--output", str(artifacts["kg"]),
+        "--filter-mode", filter_mode,
     ]
     return run_cmd(_py("build_kg.py", *args), dry_run=dry_run)
 
@@ -342,6 +351,7 @@ def step_eval_triple(cfg, attempt, seed, checkpoint, artifacts, dry_run, device)
         "--model-name", cfg["model_name"],
         "--split", "test",
         "--seed", str(seed),
+        "--out-json", str(artifacts["triple_eval"]),
     ]
     if device:
         args += ["--device", device]
@@ -490,6 +500,76 @@ def main():
     return 0
 
 
+_CSV_COLUMNS = [
+    "attempt", "seed", "max_steps", "timestamp",
+    "ner_f1", "re_f1", "triple_f1",
+    "triple_overlap_p", "triple_overlap_r", "triple_overlap_f1",
+    "rag_accuracy",
+]
+
+
+def _update_csv_from_artifacts(attempt, seed, max_steps, arts, csv_path: Path):
+    """Upsert a results row into pipeline_results.csv by merging artifact JSONs."""
+    row = {
+        "attempt": attempt,
+        "seed": str(seed),
+        "max_steps": str(max_steps) if max_steps is not None else "",
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+    triple_eval_path = arts.get("triple_eval")
+    if triple_eval_path and triple_eval_path.exists():
+        with open(triple_eval_path) as f:
+            te = json.load(f)
+        for k in ("ner_f1", "re_f1", "triple_f1"):
+            if k in te:
+                row[k] = te[k]
+
+    compare_path = arts.get("compare")
+    if compare_path and compare_path.exists():
+        with open(compare_path) as f:
+            cmp = json.load(f)
+        for k in ("triple_overlap_p", "triple_overlap_r", "triple_overlap_f1"):
+            if k in cmp:
+                row[k] = cmp[k]
+
+    rag_path = arts.get("rag")
+    if rag_path and rag_path.exists():
+        with open(rag_path) as f:
+            rag = json.load(f)
+        for k in ("accuracy", "rag_accuracy", "f1", "score"):
+            if k in rag:
+                row["rag_accuracy"] = rag[k]
+                break
+
+    key = (str(attempt), str(seed), str(max_steps) if max_steps is not None else "")
+    rows = []
+    found = False
+    if csv_path.exists():
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                r_key = (r.get("attempt", ""), r.get("seed", ""), r.get("max_steps", ""))
+                if r_key == key:
+                    found = True
+                    for col in _CSV_COLUMNS:
+                        if col in row and str(row[col]) != "":
+                            r[col] = str(row[col])
+                    rows.append(r)
+                else:
+                    rows.append(r)
+
+    if not found:
+        rows.append({col: str(row.get(col, "")) for col in _CSV_COLUMNS})
+
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_CSV_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[csv] Updated {csv_path}")
+
+
 def _list_attempts():
     col = 42
     print(f"\n{'Attempt':42s}  {'Script':16s}  {'Dataset':10s}  Description")
@@ -504,8 +584,8 @@ def _list_attempts():
 
 def _run_attempt(attempt, seed, steps, args):
     cfg = EXPERIMENT_CONFIGS[attempt]
-    ckpt = checkpoint_path(attempt, seed)
-    arts = artifact_paths(attempt, seed)
+    ckpt = checkpoint_path(attempt, seed, args.max_steps)
+    arts = artifact_paths(attempt, seed, args.max_steps)
 
     print(f"\n{'='*64}")
     print(f"ATTEMPT : {attempt}")
@@ -565,6 +645,12 @@ def _run_attempt(attempt, seed, steps, args):
 
     if "compare" in steps:
         step_compare_kgs(attempt, seed, arts, args.dry_run, round_trip=args.round_trip)
+
+    if {"triple", "rag", "compare"} & steps and not args.dry_run:
+        _update_csv_from_artifacts(
+            attempt, seed, args.max_steps, arts,
+            Path("results/pipeline_results.csv"),
+        )
 
 
 if __name__ == "__main__":

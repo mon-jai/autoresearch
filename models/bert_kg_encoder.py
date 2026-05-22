@@ -225,7 +225,11 @@ class BertBackbone(nn.Module):
 
     def __init__(self, model_name: str):
         super().__init__()
+        from transformers import logging as _hf_log
+        _prev = _hf_log.get_verbosity()
+        _hf_log.set_verbosity_error()
         self.bert = AutoModel.from_pretrained(model_name)
+        _hf_log.set_verbosity(_prev)
 
     @property
     def hidden_size(self) -> int:
