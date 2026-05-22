@@ -97,25 +97,57 @@ def main():
     )
     loader = {"train": train_loader, "dev": dev_loader, "test": test_loader}[args.split]
 
-    # Load model
+    # Load checkpoint first so we can detect the architecture before instantiation.
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    if "encoder" in ckpt:
+        state = ckpt["encoder"]
+    elif "discriminator" in ckpt:
+        state = ckpt["discriminator"]
+    else:
+        state = ckpt
+
+    # Infer max_span_width from checkpoint (overrides --max-span-width when present).
+    max_span_width = args.max_span_width
+    if "span_width_emb.weight" in state:
+        max_span_width = state["span_width_emb.weight"].shape[0]
+
+    # Detect re_context_span: RE head input is h*3 instead of h*2.
+    re_context_span = False
+    re_head_w = state.get("re_head.0.weight")
+    if re_head_w is not None:
+        from models.bert_kg_encoder import BertBackbone
+        _tmp = BertBackbone(args.model_name)
+        _h = _tmp.hidden_size
+        del _tmp
+        re_context_span = (re_head_w.shape[1] == _h * 3)
+
+    use_span_ner = any(k.startswith("span_ner_head.") for k in state)
+
     model = BertKGExtractor(
         args.model_name,
         num_bio_tags=ds_mod.NUM_BIO_TAGS,
         num_relations=ds_mod.NUM_RELATIONS,
         num_entity_types=len(ds_mod.ENTITY_TYPES),
-        use_span_ner=True,
-        max_span_width=args.max_span_width,
+        use_span_ner=use_span_ner,
+        max_span_width=max_span_width,
     ).to(device)
 
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    if "encoder" in ckpt:
-        model.load_state_dict(ckpt["encoder"])
-    elif "discriminator" in ckpt:
-        model.load_state_dict(ckpt["discriminator"])
-    else:
-        model.load_state_dict(ckpt)
+    if re_context_span:
+        import torch.nn as nn
+        _h = model.backbone.hidden_size
+        model.re_head = nn.Sequential(
+            nn.Linear(_h * 3, _h), nn.GELU(), nn.Dropout(0.1),
+            nn.Linear(_h, ds_mod.NUM_RELATIONS),
+        ).to(device)
+        model.re_context_span = True
+
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"  [warn] missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
     model.eval()
-    print(f"Loaded: {args.checkpoint}")
+    print(f"Loaded: {args.checkpoint} "
+          f"(span_ner={use_span_ner}, re_context_span={re_context_span}, "
+          f"max_span_width={max_span_width})")
     print(f"Dataset: {args.dataset} ({args.split}), {len(loader.dataset)} examples")
 
     NO_REL = ds_mod.NO_REL_ID
@@ -154,7 +186,7 @@ def main():
 
                 with torch.no_grad():
                     span_logits, candidates = model.forward_span_ner(
-                        hidden[b_idx], word_ids_list[b_idx], n_words, args.max_span_width,
+                        hidden[b_idx], word_ids_list[b_idx], n_words, max_span_width,
                     )
 
                 if not candidates:
