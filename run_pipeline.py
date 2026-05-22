@@ -64,7 +64,7 @@ EXPERIMENT_CONFIGS = {
             "--warmup-steps", "100",
             "--eval-every", "100",
         ],
-        "description": "BERT-base BIO supervised, SciERC (Stage 2 baseline)",
+        "description": "BERT-base BIO supervised, SciERC (Stage 2 baseline) [reports: morning_2026-04-11.md, morning_2026-04-12.md]",
     },
 
     # ── train_multi (BIO multi-dataset) ──────────────────────────────────────
@@ -77,7 +77,7 @@ EXPERIMENT_CONFIGS = {
             "--warmup-steps", "250",
             "--eval-every", "100",
         ],
-        "description": "SciBERT BIO multi-dataset, SciERC",
+        "description": "SciBERT BIO multi-dataset, SciERC [reports: morning_2026-04-12.md, morning_2026-04-13.md]",
     },
     "multi_conll04_bert": {
         "train_script": "train_multi",
@@ -88,7 +88,7 @@ EXPERIMENT_CONFIGS = {
             "--warmup-steps", "250",
             "--eval-every", "100",
         ],
-        "description": "BERT-base BIO multi-dataset, CoNLL04",
+        "description": "BERT-base BIO multi-dataset, CoNLL04 [reports: morning_2026-04-13.md, morning_2026-04-14.md]",
     },
     "multi_ade_scibert": {
         "train_script": "train_multi",
@@ -99,7 +99,7 @@ EXPERIMENT_CONFIGS = {
             "--warmup-steps", "250",
             "--eval-every", "100",
         ],
-        "description": "SciBERT BIO multi-dataset, ADE",
+        "description": "SciBERT BIO multi-dataset, ADE [reports: morning_2026-04-13.md, morning_2026-04-14.md]",
     },
 
     # ── train_span (span NER, SciERC) ─────────────────────────────────────────
@@ -112,7 +112,7 @@ EXPERIMENT_CONFIGS = {
             "--warmup-steps", "250",
             "--eval-every", "200",
         ],
-        "description": "Phase 12: Span NER baseline, SciERC, SciBERT",
+        "description": "Phase 12: Span NER baseline, SciERC, SciBERT [reports: morning_2026-04-14.md, morning_2026-04-15.md, morning_2026-04-16.md, morning_2026-04-17.md]",
     },
     "span_scierc_scibert_bio": {
         "train_script": "train_span",
@@ -124,7 +124,7 @@ EXPERIMENT_CONFIGS = {
             "--eval-every", "200",
             "--bio-weight", "0.1",
         ],
-        "description": "Phase 14: Span+BIO multi-task, SciERC, SciBERT",
+        "description": "Phase 14: Span+BIO multi-task, SciERC, SciBERT [reports: morning_2026-04-16.md, morning_2026-04-17.md, morning_2026-04-18.md]",
     },
 
     # ── train_span (span NER, ACCORD ablations) ───────────────────────────────
@@ -137,7 +137,7 @@ EXPERIMENT_CONFIGS = {
             "--warmup-steps", "250",
             "--eval-every", "200",
         ],
-        "description": "Phase A early: Span NER, ACCORD, BERT-base",
+        "description": "Phase A early: Span NER, ACCORD, BERT-base [reports: morning_2026-04-19.md, morning_2026-04-20.md, morning_2026-04-21.md]",
     },
     "span_accord_deberta": {
         "train_script": "train_span",
@@ -148,7 +148,7 @@ EXPERIMENT_CONFIGS = {
             "--warmup-steps", "250",
             "--eval-every", "200",
         ],
-        "description": "Phase A: Span NER, ACCORD, DeBERTa-large (no A-flags)",
+        "description": "Phase A: Span NER, ACCORD, DeBERTa-large (no A-flags) [reports: morning_2026-04-25.md, morning_2026-04-30.md, morning_2026-05-01.md, morning_2026-05-02.md]",
     },
     "span_accord_deberta_a12": {
         "train_script": "train_span",
@@ -160,7 +160,7 @@ EXPERIMENT_CONFIGS = {
             "--eval-every", "200",
             "--re-context-span",
         ],
-        "description": "Phase A12: DeBERTa-large + context-span RE, ACCORD",
+        "description": "Phase A12: DeBERTa-large + context-span RE, ACCORD [reports: morning_2026-05-09.md, morning_2026-05-10.md]",
     },
     "span_accord_deberta_aplus": {
         "train_script": "train_span",
@@ -171,7 +171,7 @@ EXPERIMENT_CONFIGS = {
             "--warmup-steps", "250",
             "--eval-every", "200",
         ] + _A20_A21_A12,
-        "description": "Phase A+: DeBERTa-large + A20+A21+A12, ACCORD (best: dev=0.4097±0.036)",
+        "description": "Phase A+: DeBERTa-large + A20+A21+A12, ACCORD (best: dev=0.4097±0.036) [reports: morning_2026-05-10.md, morning_2026-05-11.md, morning_2026-05-12.md, morning_2026-05-13.md, morning_2026-05-14.md]",
     },
 
     # ── train_span (CUAD NER pre-training, Phase B step 1) ───────────────────
@@ -185,7 +185,7 @@ EXPERIMENT_CONFIGS = {
             "--eval-every", "200",
             "--primary-metric", "ner_f1",
         ],
-        "description": "Phase B step 1: DeBERTa-large NER pre-training on CUAD",
+        "description": "Phase B step 1: DeBERTa-large NER pre-training on CUAD [reports: morning_2026-05-14.md, morning_2026-05-16.md]",
     },
 
     # ── train_span (ACCORD fine-tune from CUAD backbone, Phase B step 2) ─────
@@ -199,7 +199,7 @@ EXPERIMENT_CONFIGS = {
             "--eval-every", "200",
         ] + _A20_A21_A12,
         "requires_pretrain": "span_cuad_deberta_pretrain",
-        "description": "Phase B: DeBERTa-large + A20+A21+A12 + CUAD pre-train, ACCORD (std -42%)",
+        "description": "Phase B: DeBERTa-large + A20+A21+A12 + CUAD pre-train, ACCORD (std -42%) [reports: morning_2026-05-16.md, morning_2026-05-18.md, morning_2026-05-19.md]",
     },
 }
 
