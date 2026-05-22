@@ -42,6 +42,9 @@ def parse_args():
     p.add_argument("--data-dir", default=None, help="Path to SciERC json files")
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--save-best-to", default=None,
+                   help="Path to save the best-dev checkpoint. "
+                        "Saved as {'encoder': state_dict, 'step': int, 'metrics': dict}.")
     return p.parse_args()
 
 
@@ -119,6 +122,11 @@ def main():
                 best_metrics = dict(metrics)
                 best_step = step
                 star = " ★ NEW BEST"
+                if args.save_best_to:
+                    save_path = Path(args.save_best_to)
+                    save_path.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save({"encoder": model.state_dict(), "step": step,
+                                "metrics": metrics}, save_path)
             print(f"[Eval @ step {step}] "
                   f"NER F1={metrics['ner_f1']:.4f} | "
                   f"RE F1={metrics['re_f1']:.4f} | "
@@ -134,6 +142,11 @@ def main():
     if metrics["triple_f1"] > best_metrics["triple_f1"]:
         best_metrics = dict(metrics)
         best_step = step
+        if args.save_best_to:
+            save_path = Path(args.save_best_to)
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"encoder": model.state_dict(), "step": step,
+                        "metrics": metrics}, save_path)
     print(f"\n=== FINAL (step {step}) ===")
     print(f"  NER F1     = {metrics['ner_f1']:.4f}")
     print(f"  RE F1      = {metrics['re_f1']:.4f}")

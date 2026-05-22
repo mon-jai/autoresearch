@@ -261,3 +261,99 @@ def evaluate(model, dataloader, device) -> dict:
         "n_gold_entities": n_gold_entities,
         "n_gold_triples": n_gold_triples,
     }
+
+
+def main():
+    import argparse
+    import importlib
+    import inspect
+    import sys
+
+    p = argparse.ArgumentParser(
+        description="Triple F1 evaluation (BIO or span, auto-detected from checkpoint).")
+    p.add_argument("--checkpoint", required=True, help="Path to .pt checkpoint")
+    p.add_argument("--dataset", default="scierc",
+                   choices=["scierc", "scier", "conll04", "ade", "accord", "cuad"])
+    p.add_argument("--model-name", default=None,
+                   help="HuggingFace model ID (must match training backbone)")
+    p.add_argument("--split", default="test", choices=["train", "dev", "test"])
+    p.add_argument("--seed", type=int, default=42,
+                   help="Seed for datasets with runtime train/dev splits")
+    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--max-length", type=int, default=128)
+    p.add_argument("--device", default=None)
+    p.add_argument("--span-threshold", type=float, default=0.5,
+                   help="NER confidence threshold (span models only)")
+    args = p.parse_args()
+
+    _DATASET_REGISTRY = {
+        "scierc": "data.scierc", "scier": "data.scier",
+        "conll04": "data.conll04", "ade": "data.ade",
+        "accord": "data.code_accord", "cuad": "data.cuad",
+    }
+    _DEFAULT_MODEL = {
+        "scierc": "allenai/scibert_scivocab_uncased",
+        "scier": "allenai/scibert_scivocab_uncased",
+        "conll04": "bert-base-uncased",
+        "ade": "allenai/scibert_scivocab_uncased",
+        "accord": "bert-base-uncased",
+        "cuad": "microsoft/deberta-large",
+    }
+    if args.model_name is None:
+        args.model_name = _DEFAULT_MODEL.get(args.dataset, "bert-base-uncased")
+
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    ds_mod = importlib.import_module(_DATASET_REGISTRY[args.dataset])
+
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    dl_kwargs = dict(batch_size=args.batch_size, max_length=args.max_length)
+    if "seed" in inspect.signature(ds_mod.build_dataloaders).parameters:
+        dl_kwargs["seed"] = args.seed
+    train_loader, dev_loader, test_loader = ds_mod.build_dataloaders(tokenizer, **dl_kwargs)
+    loader = {"train": train_loader, "dev": dev_loader, "test": test_loader}[args.split]
+
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    state = ckpt["encoder"] if "encoder" in ckpt else ckpt
+    is_span = any(k.startswith("span_ner_head.") for k in state)
+
+    if is_span:
+        from eval.span_f1 import evaluate_span, load_span_model
+        print(f"Detected span model. Loading: {args.checkpoint}")
+        model, entity_type2id, id2entity_type = load_span_model(
+            args.checkpoint, args.model_name, ds_mod, device)
+        print(f"Evaluating {args.split} split ({len(loader.dataset)} examples)...")
+        metrics = evaluate_span(
+            model, loader, device, ds_mod,
+            entity_type2id, id2entity_type,
+            span_threshold=args.span_threshold,
+            verbose=True,
+        )
+        print(f"\n{args.split.upper()} NER F1={metrics['ner_f1']:.4f}  "
+              f"Triple F1={metrics['triple_f1']:.4f}")
+    else:
+        from models.bert_kg_encoder import BertKGExtractor
+        if args.dataset != "scierc":
+            print(f"  [warn] BIO eval uses SciERC tag scheme; NER F1 unreliable for "
+                  f"dataset={args.dataset!r}. Use a span checkpoint for other datasets.")
+        print(f"Detected BIO model. Loading: {args.checkpoint}")
+        model = BertKGExtractor(
+            args.model_name,
+            num_bio_tags=ds_mod.NUM_BIO_TAGS,
+            num_relations=ds_mod.NUM_RELATIONS,
+        ).to(device)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"  [warn] missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+        model.eval()
+        print(f"Evaluating {args.split} split ({len(loader.dataset)} examples)...")
+        metrics = evaluate(model, loader, device)
+        print(f"\n{args.split.upper()} NER F1={metrics['ner_f1']:.4f}  "
+              f"RE F1={metrics['re_f1']:.4f}  "
+              f"Triple F1={metrics['triple_f1']:.4f}")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())
