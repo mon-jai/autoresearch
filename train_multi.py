@@ -336,6 +336,11 @@ def main():
         if split_name == "dev" and metrics["triple_f1"] > best_metrics["triple_f1"]:
             best_metrics = dict(metrics)
             best_step = step
+            if args.save_best_to:
+                save_path = Path(args.save_best_to)
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({"encoder": model.state_dict(), "step": step,
+                            "metrics": metrics}, save_path)
         print(f"\n=== {split_name.upper()} (step {step}) ===")
         print(f"  NER={metrics['ner_f1']:.4f} RE={metrics['re_f1']:.4f} Triple={metrics['triple_f1']:.4f}")
     print(f"=== BEST DEV (step {best_step}) ===")

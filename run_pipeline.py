@@ -253,19 +253,33 @@ def run_cmd(cmd: list, dry_run: bool = False) -> int:
 
 # ── Pipeline steps ────────────────────────────────────────────────────────────
 
-def step_train(cfg, attempt, seed, checkpoint, dry_run, device):
+def step_train(cfg, attempt, seed, checkpoint, dry_run, device, max_steps_override=None, force=False):
     """5a: Train the model and save the best checkpoint."""
-    if not dry_run and checkpoint.exists():
+    if not dry_run and not force and checkpoint.exists():
         print(f"[skip] checkpoint already exists: {checkpoint}")
         return 0
 
     script = f"{cfg['train_script']}.py"
+    extra = list(cfg["extra_args"])
+    if max_steps_override is not None:
+        # Remove any --max-steps already in extra_args, then append override.
+        clean = []
+        skip_next = False
+        for tok in extra:
+            if skip_next:
+                skip_next = False
+                continue
+            if tok == "--max-steps":
+                skip_next = True
+                continue
+            clean.append(tok)
+        extra = clean + ["--max-steps", str(max_steps_override)]
     args = [
         "--dataset", cfg["dataset"],
         "--model-name", cfg["model_name"],
         "--seed", str(seed),
         "--save-best-to", str(checkpoint),
-    ] + list(cfg["extra_args"])
+    ] + extra
 
     if "requires_pretrain" in cfg:
         pretrain_name = cfg["requires_pretrain"]
@@ -442,6 +456,10 @@ def main():
                    help="Enable round-trip KG comparison in compare step (requires --steps verify).")
     p.add_argument("--device", default=None,
                    help="Torch device override (default: auto-detect cuda/cpu).")
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="Override --max-steps for every attempt (e.g. 1 or 2 for smoke tests).")
+    p.add_argument("--force", action="store_true",
+                   help="Re-run train even if the checkpoint already exists.")
     args = p.parse_args()
 
     if args.list_attempts:
@@ -500,10 +518,10 @@ def _run_attempt(attempt, seed, steps, args):
     use_verify = "verify" in steps
 
     if "train" in steps:
-        rc = step_train(cfg, attempt, seed, ckpt, args.dry_run, args.device)
+        rc = step_train(cfg, attempt, seed, ckpt, args.dry_run, args.device,
+                        max_steps_override=args.max_steps, force=args.force)
         if rc != 0:
-            print(f"[abort] train failed (rc={rc})")
-            return
+            print(f"[warn] train failed (rc={rc}); subsequent steps will skip if checkpoint/data missing")
 
     if "infer" in steps:
         if not args.dry_run and not ckpt.exists():

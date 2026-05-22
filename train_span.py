@@ -1421,7 +1421,8 @@ def main():
             print(msg)
             sys.stdout.flush()
             # Write progress to file for monitoring
-            with open("/tmp/train_progress.txt", "a") as _pf:
+            _progress_file = Path(__file__).parent / "train_progress.txt"
+            with open(_progress_file, "a") as _pf:
                 _pf.write(msg + "\n")
 
         if step > 0 and step % args.eval_every == 0:
@@ -1447,7 +1448,7 @@ def main():
                         f"Triple={metrics['triple_f1']:.4f}{star}")
             print(eval_msg)
             sys.stdout.flush()
-            with open("/tmp/train_progress.txt", "a") as _pf:
+            with open(Path(__file__).parent / "train_progress.txt", "a") as _pf:
                 _pf.write(eval_msg + "\n")
             model.train()
 
@@ -1464,18 +1465,23 @@ def main():
         if split_name == "dev" and metrics.get(args.primary_metric, 0.0) > best_metrics[args.primary_metric]:
             best_metrics = dict(metrics)
             best_step = step
+            if args.save_best_to:
+                save_path = Path(args.save_best_to)
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({"encoder": model.state_dict(), "step": step,
+                            "metrics": metrics}, save_path)
         msg = (f"\n=== {split_name.upper()} (step {step}) ===\n"
                f"  NER={metrics['ner_f1']:.4f} Triple={metrics['triple_f1']:.4f}")
         print(msg)
         sys.stdout.flush()
-        with open("/tmp/train_progress.txt", "a") as _pf:
+        with open(Path(__file__).parent / "train_progress.txt", "a") as _pf:
             _pf.write(msg + "\n")
     final_msg = (f"=== BEST DEV (step {best_step}) ===\n"
                  f"  NER={best_metrics['ner_f1']:.4f} Triple={best_metrics['triple_f1']:.4f}\n"
                  f"  time={time.time()-t0:.1f}s")
     print(final_msg)
     sys.stdout.flush()
-    with open("/tmp/train_progress.txt", "a") as _pf:
+    with open(Path(__file__).parent / "train_progress.txt", "a") as _pf:
         _pf.write(final_msg + "\n")
 
 
