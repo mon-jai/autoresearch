@@ -153,6 +153,21 @@ uv run python eval/span_f1.py \
 
 ---
 
+## Excluded train scripts
+
+Several `train_*.py` files exist in the repo but are intentionally absent from
+`EXPERIMENT_CONFIGS`. None of their functionality is duplicated by the listed
+scripts — each was excluded for a distinct reason.
+
+| Script | Why excluded |
+|---|---|
+| `train_stage2b.py` | Trains a BIO `BertKGExtractor` with an adversarial RealismCritic loss, but **requires a frozen Qwen-0.5B decoder at training time** to generate synthetic sentences. The pipeline has no Qwen dependency during training; the encoder architecture and eval path are otherwise compatible. |
+| `train_stage2c.py` | Trains a **LoRA-tuned Qwen decoder** (REINFORCE against critic + triple-recovery reward). The BERT encoder is frozen by default at a prior checkpoint. The deliverable is the Qwen LoRA weights, which `inference_kg.py` does not use. No new `BertKGExtractor` checkpoint is produced. |
+| `train_stage2d.py` | Fork of `train_stage2c.py` with an improved reward formula. Same exclusion reason: the BERT encoder is frozen; the LoRA decoder is the deliverable. |
+| `train_stage2e.py` | Trains a BIO `BertKGExtractor` on gold + LoRA-generated paraphrase data. **Compatible with the KG pipeline** in principle, but excluded because: (1) it requires a pre-generated LoRA-synth JSONL (`data/stage2e_synth_v8.jsonl`) that itself depends on a trained `train_stage2c/d` LoRA decoder; (2) its gold-only mode (`--synth-jsonl ""`) is functionally identical to `scierc_bert`; (3) the experiment was superseded by `train_span.py`, which showed larger Triple F1 gains from span NER than from LoRA data augmentation. |
+| `train.py`, `train_adversarial.py`, `train_gan.py`, `train_gumbel.py` | Stage 1 scripts — operate on random toy vectors with a `KGEncoder`/`KGDecoder` architecture. No BERT backbone; incompatible with `inference_kg.py`. |
+| `train_pretrain_cooperative.py` | ELECTRA-style cooperative pre-training. Produces a **discriminator backbone** checkpoint, not a KG extractor. Used only as `--pretrain-ckpt` input to `train_span.py`, not as a standalone pipeline entry. |
+
 ## Round-trip KG comparison
 
 The `compare` step computes triple overlap F1 between predicted and gold triples
