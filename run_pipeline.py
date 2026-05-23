@@ -212,20 +212,111 @@ EXPERIMENT_CONFIGS = {
         "requires_pretrain": "span_cuad_deberta_pretrain",
         "description": "Phase B: DeBERTa-large + A20+A21+A12 + CUAD pre-train, ACCORD (std -42%) [reports: morning_2026-05-16.md, morning_2026-05-18.md, morning_2026-05-19.md]",
     },
+
+    # ── train_gan (Stage 2-029: GAN adversarial — SciBERT encoder + LoRA Qwen) ─
+    "gan_scierc_scibert": {
+        "train_script": "train_gan",
+        "dataset": "scierc",
+        "model_name": "allenai/scibert_scivocab_uncased",
+        "extra_args": [
+            "--max-steps", "2500",
+            "--warmup-steps", "250",
+            "--eval-every", "100",
+        ],
+        "description": "Stage 2-029: GAN adversarial (SciBERT encoder + LoRA Qwen decoder), SciERC",
+    },
+
+    # ── train_gumbel (Stage 2-030: Gumbel-STE — SciBERT encoder + Gumbel-Qwen) ─
+    "gumbel_scierc_scibert": {
+        "train_script": "train_gumbel",
+        "dataset": "scierc",
+        "model_name": "allenai/scibert_scivocab_uncased",
+        "extra_args": [
+            "--max-steps", "2500",
+            "--warmup-steps", "250",
+            "--eval-every", "100",
+        ],
+        "description": "Stage 2-030: Gumbel-STE adversarial (SciBERT encoder + Gumbel-Qwen), SciERC",
+    },
+
+    # ── train_stage2b (SciBERT encoder + frozen Qwen decoder) ────────────────
+    "stage2b_scierc_scibert": {
+        "train_script": "train_stage2b",
+        "dataset": "scierc",       # informational; script hardcodes scierc data
+        "model_name": "allenai/scibert_scivocab_uncased",
+        "dataset_flag": None,       # script uses --data-dir, not --dataset
+        "extra_args": [
+            "--max-steps", "1500",
+            "--warmup-steps", "250",
+            "--eval-every", "100",
+        ],
+        "description": "Stage 2b: SciBERT encoder + frozen Qwen decoder (adversarial pre-train), SciERC",
+    },
+
+    # ── train_stage2c (SciBERT encoder + LoRA Qwen REINFORCE) ────────────────
+    "stage2c_scierc_scibert": {
+        "train_script": "train_stage2c",
+        "dataset": "scierc",
+        "model_name": "allenai/scibert_scivocab_uncased",
+        "dataset_flag": None,
+        "pretrain_arg": "--stage2b-ckpt",
+        "requires_pretrain": "stage2b_scierc_scibert",
+        "extra_args": [
+            "--max-steps", "3000",
+            "--warmup-steps", "100",
+            "--eval-every", "200",
+        ],
+        "description": "Stage 2c: SciBERT encoder + LoRA Qwen REINFORCE, SciERC [requires stage2b]",
+    },
+
+    # ── train_stage2d (SciBERT encoder + LoRA Qwen phase-based schedule) ─────
+    "stage2d_scierc_scibert": {
+        "train_script": "train_stage2d",
+        "dataset": "scierc",
+        "model_name": "allenai/scibert_scivocab_uncased",
+        "dataset_flag": None,
+        "pretrain_arg": "--stage2b-ckpt",
+        "requires_pretrain": "stage2b_scierc_scibert",
+        "extra_args": [
+            "--warmup-steps", "50",
+            "--eval-every", "100",
+        ],
+        "description": "Stage 2d: SciBERT encoder + LoRA Qwen (phase A->B schedule), SciERC [requires stage2b]",
+    },
+
+    # ── train_stage2e (SciBERT encoder + Qwen-synth data augmentation) ───────
+    "stage2e_scierc_scibert": {
+        "train_script": "train_stage2e",
+        "dataset": "scierc",
+        "model_name": "allenai/scibert_scivocab_uncased",
+        "dataset_flag": None,
+        "extra_args": [
+            "--max-steps", "1500",
+            "--warmup-steps", "250",
+            "--eval-every", "100",
+        ],
+        "description": "Stage 2e: SciBERT encoder + Qwen-generated synth data augmentation, SciERC",
+    },
 }
 
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
 
-def checkpoint_path(attempt: str, seed: int, max_steps=None) -> Path:
+_SKIP_DECODER_SCRIPTS = {
+    "train_gan", "train_gumbel",
+    "train_stage2b", "train_stage2c", "train_stage2d", "train_stage2e",
+}
+
+
+def checkpoint_path(attempt: str, seed: int, max_steps=None, name_suffix="") -> Path:
     cfg = EXPERIMENT_CONFIGS[attempt]
     suffix = f"_n{max_steps}" if max_steps is not None else ""
-    return Path(f"checkpoints/{cfg['train_script']}_{attempt}_s{seed}{suffix}_best.pt")
+    return Path(f"checkpoints/{cfg['train_script']}_{attempt}_s{seed}{suffix}{name_suffix}_best.pt")
 
 
-def artifact_paths(attempt: str, seed: int, max_steps=None) -> dict:
+def artifact_paths(attempt: str, seed: int, max_steps=None, name_suffix="") -> dict:
     suffix = f"_n{max_steps}" if max_steps is not None else ""
-    base = f"{attempt}_s{seed}{suffix}"
+    base = f"{attempt}_s{seed}{suffix}{name_suffix}"
     return {
         "inference":   Path(f"results/kg_{base}_inference.jsonl"),
         "verified":    Path(f"results/kg_{base}_verified.jsonl"),
@@ -259,7 +350,8 @@ def run_cmd(cmd: list, dry_run: bool = False) -> int:
 # ── Pipeline steps ────────────────────────────────────────────────────────────
 
 def step_train(cfg, attempt, seed, checkpoint, dry_run, device,
-               max_steps_override=None, eval_every_override=None, force=False):
+               max_steps_override=None, eval_every_override=None, force=False,
+               skip_decoder=False):
     """5a: Train the model and save the best checkpoint."""
     if not dry_run and not force and checkpoint.exists():
         print(f"[skip] checkpoint already exists: {checkpoint}")
@@ -285,22 +377,37 @@ def step_train(cfg, attempt, seed, checkpoint, dry_run, device,
         extra = _override_arg(extra, "--max-steps", max_steps_override)
     if eval_every_override is not None:
         extra = _override_arg(extra, "--eval-every", eval_every_override)
-    args = [
-        "--dataset", cfg["dataset"],
+    # dataset_flag: "--dataset" (default), or None to skip (scripts that use
+    # --data-dir or hardcode the dataset, e.g. train_stage2b/c/d/e).
+    dataset_flag = cfg.get("dataset_flag", "--dataset")
+    base_args = []
+    if dataset_flag is not None:
+        base_args += [dataset_flag, cfg["dataset"]]
+    base_args += [
         "--model-name", cfg["model_name"],
         "--seed", str(seed),
         "--save-best-to", str(checkpoint),
-    ] + extra
+    ]
+    args = base_args + extra
+
+    # Inject --skip-decoder for scripts that support it when the pipeline flag is set.
+    if skip_decoder and cfg["train_script"] in _SKIP_DECODER_SCRIPTS:
+        if "--skip-decoder" not in args:
+            args = args + ["--skip-decoder"]
 
     if "requires_pretrain" in cfg:
         pretrain_name = cfg["requires_pretrain"]
-        pretrain_ckpt = checkpoint_path(pretrain_name, seed, max_steps_override)
+        # Pretrain checkpoint lives in the same name-space (noqwen if skip_decoder).
+        pretrain_suffix = "_noqwen" if skip_decoder else ""
+        pretrain_ckpt = checkpoint_path(pretrain_name, seed, max_steps_override, pretrain_suffix)
         if not dry_run and not pretrain_ckpt.exists():
-            print(f"[error] Phase B requires pretrain checkpoint: {pretrain_ckpt}")
+            print(f"[error] {attempt} requires pretrain checkpoint: {pretrain_ckpt}")
             print(f"  Run --attempt {pretrain_name} --seed {seed} first.")
             return 1
-        if "--pretrain-ckpt" not in cfg["extra_args"]:
-            args += ["--pretrain-ckpt", str(pretrain_ckpt)]
+        # pretrain_arg: "--pretrain-ckpt" (default) or script-specific name
+        pretrain_arg = cfg.get("pretrain_arg", "--pretrain-ckpt")
+        if pretrain_arg not in cfg["extra_args"]:
+            args += [pretrain_arg, str(pretrain_ckpt)]
 
     if device:
         args += ["--device", device]
@@ -478,6 +585,9 @@ def main():
                    help="Override --eval-every for every attempt (useful with --max-steps for smoke tests).")
     p.add_argument("--force", action="store_true",
                    help="Re-run train even if the checkpoint already exists.")
+    p.add_argument("--skip-decoder", action="store_true",
+                   help="Pass --skip-decoder to Qwen-bearing scripts (gan/gumbel/stage2b/c/d/e). "
+                        "Adds _noqwen suffix to all artifact names for run isolation.")
     args = p.parse_args()
 
     if args.list_attempts:
@@ -586,14 +696,15 @@ def _list_attempts():
         note = " *pretrain required*" if "requires_pretrain" in cfg else ""
         print(f"{name:{col}s}  {cfg['train_script']:16s}  {cfg['dataset']:10s}  "
               f"{cfg['description']}{note}")
-    print(f"\n  * span_accord_deberta_phase_b requires span_cuad_deberta_pretrain "
-          f"checkpoint first.")
+    print(f"\n  * Entries marked *pretrain required* need their pretrain attempt run first.")
 
 
 def _run_attempt(attempt, seed, steps, args):
     cfg = EXPERIMENT_CONFIGS[attempt]
-    ckpt = checkpoint_path(attempt, seed, args.max_steps)
-    arts = artifact_paths(attempt, seed, args.max_steps)
+    skip_decoder = getattr(args, "skip_decoder", False)
+    name_suffix = "_noqwen" if skip_decoder else ""
+    ckpt = checkpoint_path(attempt, seed, args.max_steps, name_suffix)
+    arts = artifact_paths(attempt, seed, args.max_steps, name_suffix)
 
     print(f"\n{'='*64}")
     print(f"ATTEMPT : {attempt}")
@@ -601,6 +712,8 @@ def _run_attempt(attempt, seed, steps, args):
     print(f"SEED    : {seed}")
     print(f"STEPS   : {', '.join(sorted(steps))}")
     print(f"CKPT    : {ckpt}")
+    if name_suffix:
+        print(f"SUFFIX  : {name_suffix}  (--skip-decoder)")
     print(f"{'='*64}")
 
     use_verify = "verify" in steps
@@ -609,7 +722,8 @@ def _run_attempt(attempt, seed, steps, args):
         rc = step_train(cfg, attempt, seed, ckpt, args.dry_run, args.device,
                         max_steps_override=args.max_steps,
                         eval_every_override=args.eval_every,
-                        force=args.force)
+                        force=args.force,
+                        skip_decoder=skip_decoder)
         if rc != 0:
             print(f"[warn] train failed (rc={rc}); subsequent steps will skip if checkpoint/data missing")
 

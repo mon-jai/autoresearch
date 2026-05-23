@@ -69,6 +69,8 @@ def parse_args():
                    help="FGM adversarial perturbation epsilon on word embeddings. "
                         "0 = disabled. Recommended: 0.5-1.0 (READ-style).")
     p.add_argument("--save-best-to", default=None)
+    p.add_argument("--skip-decoder", action="store_true",
+                   help="No-op: stage2e has no decoder. Accepted for pipeline compatibility.")
     return p.parse_args()
 
 

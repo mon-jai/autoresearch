@@ -70,6 +70,9 @@ def parse_args():
                    help="If set, save encoder+critic weights to this path "
                         "whenever dev Triple F1 is a new best. Used by Stage "
                         "2c to get a frozen recovery encoder.")
+    p.add_argument("--skip-decoder", action="store_true",
+                   help="Skip Qwen/critic/arXiv — run supervised encoder only. "
+                        "For fast smoke testing.")
     return p.parse_args()
 
 
@@ -122,6 +125,10 @@ def main():
     if args.adversarial_start is None:
         args.adversarial_start = args.warmup_steps
 
+    if args.skip_decoder:
+        args.adversarial_start = args.max_steps + 1
+        print("[skip-decoder] Qwen/adversarial step disabled — supervised encoder only.")
+
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print("=== Stage 2b — Encoder + Critic + frozen Qwen Decoder ===")
     print(f"  encoder:  {args.model_name}")
@@ -141,25 +148,36 @@ def main():
         tokenizer, data_dir=data_dir,
         batch_size=args.batch_size, max_length=args.max_length,
     )
-    arxiv_loader = build_arxiv_loader(
-        tokenizer,
-        batch_size=args.synth_batch_size,
-        max_length=args.max_length,
-        jsonl_path=args.arxiv_jsonl,
-    )
+    if not args.skip_decoder:
+        arxiv_loader = build_arxiv_loader(
+            tokenizer,
+            batch_size=args.synth_batch_size,
+            max_length=args.max_length,
+            jsonl_path=args.arxiv_jsonl,
+        )
+    else:
+        arxiv_loader = None
     print(f"  sci train sentences:  {len(train_loader.dataset)}")
     print(f"  sci dev   sentences:  {len(dev_loader.dataset)}")
-    print(f"  arxiv real corpus:    {len(arxiv_loader.dataset)} documents")
+    if arxiv_loader is not None:
+        print(f"  arxiv real corpus:    {len(arxiv_loader.dataset)} documents")
 
     # ── Model + critic + decoder ─────────────────────────────────────
     model = BertKGExtractor(args.model_name).to(device)
     hidden = model.backbone.hidden_size
-    critic = RealismCritic(hidden).to(device)
-    decoder = FrozenQwenDecoder(args.decoder_name, device=device)
+    if not args.skip_decoder:
+        critic = RealismCritic(hidden).to(device)
+        decoder = FrozenQwenDecoder(args.decoder_name, device=device)
+    else:
+        critic = None
+        decoder = None
 
     # Critic + encoder share params via the encoder body. AdamW gets all
     # trainable params from both modules.
-    trainable_params = list(model.parameters()) + list(critic.parameters())
+    if not args.skip_decoder:
+        trainable_params = list(model.parameters()) + list(critic.parameters())
+    else:
+        trainable_params = list(model.parameters())
     optimizer = AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
@@ -167,13 +185,14 @@ def main():
         num_training_steps=args.max_steps,
     )
 
-    arxiv_iter = cycle(arxiv_loader)
+    arxiv_iter = cycle(arxiv_loader) if not args.skip_decoder else None
     sci_iter = iter(train_loader)
     best_metrics = {"triple_f1": -1.0}
     best_step = -1
 
     model.train()
-    critic.train()
+    if not args.skip_decoder:
+        critic.train()
 
     t0 = time.time()
     step = 0
@@ -256,13 +275,15 @@ def main():
                 if args.save_best_to:
                     save_path = Path(args.save_best_to)
                     save_path.parent.mkdir(parents=True, exist_ok=True)
-                    torch.save({
+                    ckpt = {
                         "encoder": model.state_dict(),
-                        "critic": critic.state_dict(),
                         "step": step,
                         "metrics": metrics,
                         "args": vars(args),
-                    }, save_path)
+                    }
+                    if not args.skip_decoder:
+                        ckpt["critic"] = critic.state_dict()
+                    torch.save(ckpt, save_path)
                     star += f" (ckpt→{save_path})"
             print(
                 f"[Eval @ step {step}] "

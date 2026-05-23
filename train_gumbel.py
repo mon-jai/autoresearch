@@ -37,7 +37,6 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from models.bert_kg_encoder import BertKGExtractor
 from models.critic import RealismCritic, critic_loss
-from models.decoder_d_lora import LoRAQwenDecoder
 from data.arxiv_real import build_arxiv_loader, cycle as arxiv_cycle
 
 
@@ -108,6 +107,9 @@ def parse_args():
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save-best-to", default=None)
+    p.add_argument("--skip-decoder", action="store_true",
+                   help="Skip Qwen/critic/arXiv — run supervised encoder only. "
+                        "For fast smoke testing.")
     return p.parse_args()
 
 
@@ -306,11 +308,20 @@ def main():
     train_loader, dev_loader, test_loader = ds_mod.build_dataloaders(
         tokenizer, batch_size=args.batch_size, max_length=args.max_length,
     )
-    arxiv_loader = build_arxiv_loader(
-        tokenizer, batch_size=args.synth_batch_size, max_length=args.max_length,
-    )
-    print(f"  train: {len(train_loader.dataset)} | dev: {len(dev_loader.dataset)} "
-          f"| arXiv: {len(arxiv_loader.dataset)}")
+    if args.skip_decoder:
+        arxiv_loader = None
+        print("[skip-decoder] Qwen/adversarial step disabled — supervised encoder only.")
+        print("[skip-decoder: no arXiv]")
+    else:
+        arxiv_loader = build_arxiv_loader(
+            tokenizer, batch_size=args.synth_batch_size, max_length=args.max_length,
+        )
+    if arxiv_loader is not None:
+        print(f"  train: {len(train_loader.dataset)} | dev: {len(dev_loader.dataset)} "
+              f"| arXiv: {len(arxiv_loader.dataset)}")
+    else:
+        print(f"  train: {len(train_loader.dataset)} | dev: {len(dev_loader.dataset)} "
+              f"| arXiv: (skipped)")
 
     # -- Encoder (span NER v10 config) --
     entity_types = ds_mod.ENTITY_TYPES
@@ -328,32 +339,43 @@ def main():
 
     # -- Critic --
     hidden_size = encoder.backbone.hidden_size
-    critic_model = RealismCritic(hidden_size).to(device)
+    if not args.skip_decoder:
+        from models.decoder_d_lora import LoRAQwenDecoder  # lazy: peft not needed for encoder-only
+        critic_model = RealismCritic(hidden_size).to(device)
 
-    # -- Decoder (LoRA) --
-    decoder = LoRAQwenDecoder(
-        args.decoder_name, device=device,
-        lora_r=args.lora_r, lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-    )
+        # -- Decoder (LoRA) --
+        decoder = LoRAQwenDecoder(
+            args.decoder_name, device=device,
+            lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+        )
 
-    # -- Vocab projection (Qwen hidden -> SciBERT hidden) --
-    # Get Qwen hidden size from the already-loaded model (no extra HF call)
-    qwen_hidden = decoder.model.config.hidden_size
-    projection = VocabProjection(qwen_hidden, hidden_size).to(device)
-    print(f"  projection:  {qwen_hidden} -> {hidden_size}")
+        # -- Vocab projection (Qwen hidden -> SciBERT hidden) --
+        # Get Qwen hidden size from the already-loaded model (no extra HF call)
+        qwen_hidden = decoder.model.config.hidden_size
+        projection = VocabProjection(qwen_hidden, hidden_size).to(device)
+        print(f"  projection:  {qwen_hidden} -> {hidden_size}")
+    else:
+        critic_model = None
+        decoder = None
+        projection = None
 
     # -- Optimizers --
     encoder_optimizer = AdamW(encoder.parameters(), lr=args.encoder_lr, weight_decay=0.01)
-    critic_optimizer = AdamW(critic_model.parameters(), lr=args.critic_lr, weight_decay=0.01)
+    if not args.skip_decoder:
+        critic_optimizer = AdamW(critic_model.parameters(), lr=args.critic_lr, weight_decay=0.01)
 
-    lora_params = [p for p in decoder.model.parameters() if p.requires_grad]
-    # Decoder optimizer includes projection params (both are updated in Step B)
-    decoder_optimizer = AdamW(
-        [{"params": lora_params, "lr": args.lora_lr},
-         {"params": projection.parameters(), "lr": args.proj_lr}],
-        weight_decay=0.01,
-    )
+        lora_params = [p for p in decoder.model.parameters() if p.requires_grad]
+        # Decoder optimizer includes projection params (both are updated in Step B)
+        decoder_optimizer = AdamW(
+            [{"params": lora_params, "lr": args.lora_lr},
+             {"params": projection.parameters(), "lr": args.proj_lr}],
+            weight_decay=0.01,
+        )
+    else:
+        critic_optimizer = None
+        lora_params = []
+        decoder_optimizer = None
 
     encoder_scheduler = get_linear_schedule_with_warmup(
         encoder_optimizer, args.warmup_steps, args.max_steps,
@@ -361,22 +383,23 @@ def main():
 
     # -- Iterators --
     gold_iter = cycle(train_loader)
-    arxiv_iter = arxiv_cycle(arxiv_loader)
+    arxiv_iter = arxiv_cycle(arxiv_loader) if not args.skip_decoder else None
     best_metrics = {"triple_f1": -1.0}
     best_step = -1
 
     from train_span import compute_span_loss, evaluate_span
 
     encoder.train()
-    critic_model.train()
-    projection.train()
+    if not args.skip_decoder:
+        critic_model.train()
+        projection.train()
     t0 = time.time()
 
     for step in range(args.max_steps):
         gold_batch = next(gold_iter)
         triples = sample_triples(gold_batch, ds_mod, args.synth_batch_size)
 
-        adv_active = (step >= args.adv_start_step and
+        adv_active = (not args.skip_decoder) and (step >= args.adv_start_step and
                       (args.adv_stop_step == 0 or step < args.adv_stop_step))
 
         # Compute current tau (with optional annealing)
@@ -489,7 +512,7 @@ def main():
         # Step C: Train Encoder (span NER + RE on gold data)
         # ============================================================
         encoder_optimizer.zero_grad()
-        enc_loss, ner_loss, re_loss = compute_span_loss(
+        enc_loss, ner_loss, re_loss, *_ = compute_span_loss(
             encoder, gold_batch, device, ds_mod, entity_type2id,
             re_weight=args.re_weight, neg_sample_ratio=args.neg_sample_ratio,
             max_span_width=args.max_span_width, focal_gamma=args.focal_gamma,
@@ -527,17 +550,17 @@ def main():
                 if args.save_best_to:
                     save_path = Path(args.save_best_to)
                     save_path.parent.mkdir(parents=True, exist_ok=True)
-                    torch.save({
-                        "encoder": encoder.state_dict(),
-                        "critic": critic_model.state_dict(),
-                        "projection": projection.state_dict(),
-                        "step": step, "metrics": metrics,
-                    }, save_path)
+                    ckpt = {"encoder": encoder.state_dict(), "step": step, "metrics": metrics}
+                    if not args.skip_decoder:
+                        ckpt["critic"] = critic_model.state_dict()
+                        ckpt["projection"] = projection.state_dict()
+                    torch.save(ckpt, save_path)
             print(f"[Eval @ {step}] NER={metrics['ner_f1']:.4f} "
                   f"Triple={metrics['triple_f1']:.4f}{star}")
             encoder.train()
-            critic_model.train()
-            projection.train()
+            if not args.skip_decoder:
+                critic_model.train()
+                projection.train()
 
     # Final eval
     for name, loader in [("dev", dev_loader), ("test", test_loader)]:

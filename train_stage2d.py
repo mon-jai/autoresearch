@@ -27,9 +27,8 @@ from torch.optim import AdamW
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 from data.scierc import build_dataloaders, ID2REL, NO_REL_ID
-from models.bert_kg_encoder import BertKGExtractor
+from models.bert_kg_encoder import BertKGExtractor, compute_loss
 from models.critic import RealismCritic
-from models.decoder_d_lora import LoRAQwenDecoder
 from models import encoder_reward as er_mod
 from eval.triple_f1 import evaluate
 
@@ -81,6 +80,15 @@ def parse_args():
     p.add_argument("--variant-tag", default="default",
                    help="Variant identifier (e.g. v7, r16_lr1e6). Used only "
                         "when --save-adapters-to is None to build the default path.")
+    p.add_argument("--save-best-to", default=None,
+                   help="Path to save the best encoder state dict as a .pt file "
+                        "(compatible with inference_kg.py / eval/triple_f1.py).")
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="Total-steps shortcut: 30%% phase-A, 70%% phase-B. "
+                        "Overrides --phase-a-steps and --phase-b-steps when set.")
+    p.add_argument("--skip-decoder", action="store_true",
+                   help="Skip Qwen/critic — run supervised encoder (Phase-A) only. "
+                        "For fast smoke testing.")
     return p.parse_args()
 
 
@@ -120,6 +128,18 @@ def main():
     torch.manual_seed(args.seed)
     random.seed(args.seed)
 
+    # --max-steps shortcut: distribute 30% to phase-A, 70% to phase-B.
+    if args.max_steps is not None:
+        args.phase_a_steps = max(1, int(0.30 * args.max_steps))
+        args.phase_b_steps = max(1, args.max_steps - args.phase_a_steps)
+
+    if args.skip_decoder:
+        # Skip all adversarial phases; run full --max-steps as supervised encoder.
+        if args.max_steps is not None:
+            args.phase_a_steps = args.max_steps
+        args.phase_b_steps = 0
+        print("[skip-decoder] Adversarial phases disabled; supervised encoder for all steps.")
+
     # Fill in variant-aware default for adapter save path so that
     # ablation runs (v5, v6, v7...) don't silently overwrite each other.
     if args.save_adapters_to is None:
@@ -148,32 +168,53 @@ def main():
     )
     print(f"  sci train: {len(train_loader.dataset)} | sci dev: {len(dev_loader.dataset)}")
 
-    # Encoder + critic — ALWAYS frozen in Stage 2d (Q4 A).
+    # Encoder + critic — frozen when decoder active (LoRA only), trainable in skip_decoder mode.
     model = BertKGExtractor(args.model_name).to(device)
     hidden = model.backbone.hidden_size
     critic = RealismCritic(hidden).to(device)
-    load_stage2b_ckpt(args.stage2b_ckpt, model, critic)
-    model.eval()
-    critic.eval()
-    for p in model.parameters():
-        p.requires_grad = False
-    for p in critic.parameters():
-        p.requires_grad = False
+    if not args.skip_decoder:
+        load_stage2b_ckpt(args.stage2b_ckpt, model, critic)
+    if args.skip_decoder:
+        # Encoder-only supervised baseline — keep params trainable
+        model.train()
+        critic.train()
+    else:
+        model.eval()
+        critic.eval()
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in critic.parameters():
+            p.requires_grad = False
 
-    # LoRA decoder
-    decoder = LoRAQwenDecoder(
-        args.decoder_name, device=device,
-        lora_r=args.lora_r, lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-    )
+    if not args.skip_decoder:
+        from models.decoder_d_lora import LoRAQwenDecoder  # lazy: peft not needed for encoder-only
+        # LoRA decoder
+        decoder = LoRAQwenDecoder(
+            args.decoder_name, device=device,
+            lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+        )
 
-    lora_params = [p for p in decoder.model.parameters() if p.requires_grad]
-    optimizer = AdamW(lora_params, lr=args.lora_lr, weight_decay=0.01)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=args.warmup_steps,
-        num_training_steps=total_steps,
-    )
+        lora_params = [p for p in decoder.model.parameters() if p.requires_grad]
+        optimizer = AdamW(lora_params, lr=args.lora_lr, weight_decay=0.01)
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=args.warmup_steps,
+            num_training_steps=total_steps,
+        )
+    else:
+        decoder = None
+        lora_params = []
+        # skip_decoder: supervised encoder optimizer
+        optimizer = AdamW(
+            list(model.parameters()) + list(critic.parameters()),
+            lr=3e-5, weight_decay=0.01,
+        )
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=args.warmup_steps,
+            num_training_steps=max(total_steps, 1),
+        )
 
     sci_iter = iter(train_loader)
     best_metrics = {"triple_f1": -1.0}
@@ -193,6 +234,32 @@ def main():
 
         phase = "A" if step < args.phase_a_steps else "B"
         cur_alpha = 0.0 if phase == "A" else args.alpha
+
+        if args.skip_decoder:
+            # Encoder-only supervised baseline — run NER+RE loss, skip adversarial
+            optimizer.zero_grad()
+            sup_loss, _, _, _ = compute_loss(model, sci_batch, device)
+            sup_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+            step += 1
+            if step > 0 and step % args.eval_every == 0:
+                metrics = evaluate(model, dev_loader, device)
+                star = ""
+                if metrics["triple_f1"] > best_metrics["triple_f1"]:
+                    best_metrics = dict(metrics)
+                    best_step = step
+                    star = " ★ NEW BEST"
+                    if args.save_best_to:
+                        _sp = Path(args.save_best_to)
+                        _sp.parent.mkdir(parents=True, exist_ok=True)
+                        torch.save({"encoder": model.state_dict(), "step": step,
+                                    "metrics": metrics, "args": vars(args)}, _sp)
+                        star += f" (encoder->{_sp})"
+                print(f"[Eval @ step {step}] NER F1={metrics['ner_f1']:.4f} | "
+                      f"Triple F1={metrics['triple_f1']:.4f}{star}")
+            continue
 
         triples = sample_triples_from_batch(sci_batch, n=args.synth_batch_size)
         if not triples:
@@ -281,8 +348,19 @@ def main():
                 best_metrics = dict(metrics)
                 best_step = step
                 star = " ★ NEW BEST"
-                decoder.save_adapters(args.save_adapters_to)
-                star += f" (lora→{args.save_adapters_to})"
+                if not args.skip_decoder:
+                    decoder.save_adapters(args.save_adapters_to)
+                    star += f" (lora→{args.save_adapters_to})"
+                if args.save_best_to:
+                    _sp = Path(args.save_best_to)
+                    _sp.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save({
+                        "encoder": model.state_dict(),
+                        "step": step,
+                        "metrics": metrics,
+                        "args": vars(args),
+                    }, _sp)
+                    star += f" (encoder→{_sp})"
             print(
                 f"[Eval @ step {step}] "
                 f"NER F1={metrics['ner_f1']:.4f} | "
@@ -309,9 +387,10 @@ def main():
     print(f"  total time= {time.time() - t0:.1f}s")
     # Always save the final LoRA (the "best" save only fires on encoder
     # F1 improvement, which never happens when the encoder is frozen).
-    final_path = args.save_adapters_to + "_final"
-    decoder.save_adapters(final_path)
-    print(f"  final lora saved → {final_path}")
+    if not args.skip_decoder:
+        final_path = args.save_adapters_to + "_final"
+        decoder.save_adapters(final_path)
+        print(f"  final lora saved → {final_path}")
 
 
 if __name__ == "__main__":

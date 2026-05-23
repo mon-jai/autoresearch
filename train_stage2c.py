@@ -35,7 +35,6 @@ from data.scierc import build_dataloaders, ID2REL, NO_REL_ID
 from data.arxiv_real import build_arxiv_loader, cycle
 from models.bert_kg_encoder import BertKGExtractor, compute_loss
 from models.critic import RealismCritic, critic_loss
-from models.decoder_d_lora import LoRAQwenDecoder
 from models import triple_recovery as tr_mod
 from eval.triple_f1 import evaluate
 
@@ -74,6 +73,12 @@ def parse_args():
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save-adapters-to", default="checkpoints/stage2_008_lora")
+    p.add_argument("--save-best-to", default=None,
+                   help="Path to save the best encoder state dict as a .pt file "
+                        "(compatible with inference_kg.py / eval/triple_f1.py).")
+    p.add_argument("--skip-decoder", action="store_true",
+                   help="Skip Qwen/critic/arXiv — run supervised encoder only. "
+                        "For fast smoke testing.")
     return p.parse_args()
 
 
@@ -144,31 +149,41 @@ def main():
         tokenizer, data_dir=data_dir,
         batch_size=args.batch_size, max_length=args.max_length,
     )
-    arxiv_loader = build_arxiv_loader(
-        tokenizer,
-        batch_size=args.synth_batch_size,
-        max_length=args.max_length,
-        jsonl_path=args.arxiv_jsonl,
-    )
-    print(f"  sci train: {len(train_loader.dataset)} | sci dev: {len(dev_loader.dataset)} "
-          f"| arxiv: {len(arxiv_loader.dataset)}")
+    if not args.skip_decoder:
+        arxiv_loader = build_arxiv_loader(
+            tokenizer,
+            batch_size=args.synth_batch_size,
+            max_length=args.max_length,
+            jsonl_path=args.arxiv_jsonl,
+        )
+    else:
+        arxiv_loader = None
+        print("[skip-decoder] Qwen/adversarial step disabled — supervised encoder only.")
+    if arxiv_loader is not None:
+        print(f"  sci train: {len(train_loader.dataset)} | sci dev: {len(dev_loader.dataset)} "
+              f"| arxiv: {len(arxiv_loader.dataset)}")
+    else:
+        print(f"  sci train: {len(train_loader.dataset)} | sci dev: {len(dev_loader.dataset)}")
 
     # ── Encoder + critic (trainable or frozen) ──────────────────────
     model = BertKGExtractor(args.model_name).to(device)
     hidden = model.backbone.hidden_size
     critic = RealismCritic(hidden).to(device)
-    load_stage2b_ckpt(args.stage2b_ckpt, model, critic)
+    if not args.skip_decoder:
+        load_stage2b_ckpt(args.stage2b_ckpt, model, critic)
 
-    # Frozen recovery encoder — a second copy of the same stage2b ckpt,
-    # used only by models.triple_recovery. Always frozen regardless of --train-encoder.
-    recovery_encoder = BertKGExtractor(args.model_name).to(device)
-    rec_critic_unused = RealismCritic(hidden).to(device)   # only so load_state_dict works
-    load_stage2b_ckpt(args.stage2b_ckpt, recovery_encoder, rec_critic_unused)
-    recovery_encoder.eval()
-    for p in recovery_encoder.parameters():
-        p.requires_grad = False
+        # Frozen recovery encoder — a second copy of the same stage2b ckpt,
+        # used only by models.triple_recovery. Always frozen regardless of --train-encoder.
+        recovery_encoder = BertKGExtractor(args.model_name).to(device)
+        rec_critic_unused = RealismCritic(hidden).to(device)   # only so load_state_dict works
+        load_stage2b_ckpt(args.stage2b_ckpt, recovery_encoder, rec_critic_unused)
+        recovery_encoder.eval()
+        for p in recovery_encoder.parameters():
+            p.requires_grad = False
+    else:
+        recovery_encoder = None
 
-    if not args.train_encoder:
+    if not args.train_encoder and not args.skip_decoder:
         model.eval()
         critic.eval()
         for p in model.parameters():
@@ -176,27 +191,42 @@ def main():
         for p in critic.parameters():
             p.requires_grad = False
 
-    # ── LoRA decoder ────────────────────────────────────────────────
-    decoder = LoRAQwenDecoder(
-        args.decoder_name, device=device,
-        lora_r=args.lora_r, lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-    )
+    if not args.skip_decoder:
+        # ── LoRA decoder ────────────────────────────────────────────────
+        from models.decoder_d_lora import LoRAQwenDecoder  # lazy: peft not needed for encoder-only
+        decoder = LoRAQwenDecoder(
+            args.decoder_name, device=device,
+            lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+        )
 
-    # ── Optimizer ──────────────────────────────────────────────────
-    lora_params = [p for p in decoder.model.parameters() if p.requires_grad]
-    param_groups = [{"params": lora_params, "lr": args.lora_lr}]
-    if args.train_encoder:
-        param_groups.append({"params": list(model.parameters()) + list(critic.parameters()),
-                             "lr": args.encoder_lr})
-    optimizer = AdamW(param_groups, weight_decay=0.01)
+        # ── Optimizer ──────────────────────────────────────────────────
+        lora_params = [p for p in decoder.model.parameters() if p.requires_grad]
+        param_groups = [{"params": lora_params, "lr": args.lora_lr}]
+        if args.train_encoder:
+            param_groups.append({"params": list(model.parameters()) + list(critic.parameters()),
+                                 "lr": args.encoder_lr})
+        optimizer = AdamW(param_groups, weight_decay=0.01)
+    else:
+        decoder = None
+        lora_params = []
+        # skip_decoder: always run supervised encoder (encoder-only baseline)
+        model.train()
+        critic.train()
+        for p in model.parameters():
+            p.requires_grad = True
+        for p in critic.parameters():
+            p.requires_grad = True
+        param_groups = [{"params": list(model.parameters()) + list(critic.parameters()),
+                         "lr": args.encoder_lr}]
+        optimizer = AdamW(param_groups, weight_decay=0.01)
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=args.warmup_steps,
         num_training_steps=args.max_steps,
     )
 
-    arxiv_iter = cycle(arxiv_loader)
+    arxiv_iter = cycle(arxiv_loader) if not args.skip_decoder else None
     sci_iter = iter(train_loader)
     best_metrics = {"triple_f1": -1.0}
     best_step = -1
@@ -215,16 +245,16 @@ def main():
 
         total = torch.tensor(0.0, device=device)
 
-        # ── Supervised (optional, only if encoder is training) ─────
+        # ── Supervised (required in skip_decoder mode; optional otherwise) ─────
         sup_loss_val = 0.0
-        if args.train_encoder:
+        if args.train_encoder or args.skip_decoder:
             sup_loss, _, _, _ = compute_loss(model, sci_batch, device)
             total = total + sup_loss
             sup_loss_val = sup_loss.item()
 
         # ── Critic step (optional) ─────────────────────────────────
         crit_val = 0.0
-        if args.train_encoder:
+        if args.train_encoder and not args.skip_decoder:
             real_batch = next(arxiv_iter)
             real_hidden = model.encode(
                 modality="text",
@@ -242,7 +272,7 @@ def main():
         recovery_reward_val = 0.0
         kl_val = 0.0
 
-        if triples:
+        if triples and not args.skip_decoder:
             sampled = decoder.sample_with_logprob(triples)
             synth_sentences = sampled["sentences"]
             lora_lp = sampled["lora_logprob"]         # (B,) with grad
@@ -334,8 +364,19 @@ def main():
                 best_metrics = dict(metrics)
                 best_step = step
                 star = " ★ NEW BEST"
-                decoder.save_adapters(args.save_adapters_to)
-                star += f" (lora→{args.save_adapters_to})"
+                if decoder is not None:
+                    decoder.save_adapters(args.save_adapters_to)
+                    star += f" (lora→{args.save_adapters_to})"
+                if args.save_best_to:
+                    _sp = Path(args.save_best_to)
+                    _sp.parent.mkdir(parents=True, exist_ok=True)
+                    torch.save({
+                        "encoder": model.state_dict(),
+                        "step": step,
+                        "metrics": metrics,
+                        "args": vars(args),
+                    }, _sp)
+                    star += f" (encoder→{_sp})"
             print(
                 f"[Eval @ step {step}] "
                 f"NER F1={metrics['ner_f1']:.4f} | "
@@ -343,7 +384,7 @@ def main():
                 f"Triple F1={metrics['triple_f1']:.4f} | "
                 f"EMA baseline={ema_baseline:+.3f}{star}"
             )
-            if args.train_encoder:
+            if args.train_encoder or args.skip_decoder:
                 model.train()
 
         step += 1
