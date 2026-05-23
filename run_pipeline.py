@@ -258,7 +258,8 @@ def run_cmd(cmd: list, dry_run: bool = False) -> int:
 
 # ── Pipeline steps ────────────────────────────────────────────────────────────
 
-def step_train(cfg, attempt, seed, checkpoint, dry_run, device, max_steps_override=None, force=False):
+def step_train(cfg, attempt, seed, checkpoint, dry_run, device,
+               max_steps_override=None, eval_every_override=None, force=False):
     """5a: Train the model and save the best checkpoint."""
     if not dry_run and not force and checkpoint.exists():
         print(f"[skip] checkpoint already exists: {checkpoint}")
@@ -266,19 +267,24 @@ def step_train(cfg, attempt, seed, checkpoint, dry_run, device, max_steps_overri
 
     script = f"{cfg['train_script']}.py"
     extra = list(cfg["extra_args"])
-    if max_steps_override is not None:
-        # Remove any --max-steps already in extra_args, then append override.
-        clean = []
-        skip_next = False
-        for tok in extra:
-            if skip_next:
-                skip_next = False
+
+    def _override_arg(args_list, flag, value):
+        """Remove existing flag+value pair from args_list, then append new value."""
+        clean, skip = [], False
+        for tok in args_list:
+            if skip:
+                skip = False
                 continue
-            if tok == "--max-steps":
-                skip_next = True
+            if tok == flag:
+                skip = True
                 continue
             clean.append(tok)
-        extra = clean + ["--max-steps", str(max_steps_override)]
+        return clean + [flag, str(value)]
+
+    if max_steps_override is not None:
+        extra = _override_arg(extra, "--max-steps", max_steps_override)
+    if eval_every_override is not None:
+        extra = _override_arg(extra, "--eval-every", eval_every_override)
     args = [
         "--dataset", cfg["dataset"],
         "--model-name", cfg["model_name"],
@@ -468,6 +474,8 @@ def main():
                    help="Torch device override (default: auto-detect cuda/cpu).")
     p.add_argument("--max-steps", type=int, default=None,
                    help="Override --max-steps for every attempt (e.g. 1 or 2 for smoke tests).")
+    p.add_argument("--eval-every", type=int, default=None,
+                   help="Override --eval-every for every attempt (useful with --max-steps for smoke tests).")
     p.add_argument("--force", action="store_true",
                    help="Re-run train even if the checkpoint already exists.")
     args = p.parse_args()
@@ -599,7 +607,9 @@ def _run_attempt(attempt, seed, steps, args):
 
     if "train" in steps:
         rc = step_train(cfg, attempt, seed, ckpt, args.dry_run, args.device,
-                        max_steps_override=args.max_steps, force=args.force)
+                        max_steps_override=args.max_steps,
+                        eval_every_override=args.eval_every,
+                        force=args.force)
         if rc != 0:
             print(f"[warn] train failed (rc={rc}); subsequent steps will skip if checkpoint/data missing")
 
