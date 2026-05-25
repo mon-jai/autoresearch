@@ -478,6 +478,9 @@ def main():
                    help="Override --eval-every for every attempt (useful with --max-steps for smoke tests).")
     p.add_argument("--force", action="store_true",
                    help="Re-run train even if the checkpoint already exists.")
+    p.add_argument("--force-dataset", default=None,
+                   help="Override the dataset for every attempt (e.g. 'accord'). "
+                        "Useful for smoke-testing all configs against one dataset.")
     args = p.parse_args()
 
     if args.list_attempts:
@@ -591,7 +594,9 @@ def _list_attempts():
 
 
 def _run_attempt(attempt, seed, steps, args):
-    cfg = EXPERIMENT_CONFIGS[attempt]
+    cfg = dict(EXPERIMENT_CONFIGS[attempt])   # shallow copy — safe to mutate
+    if getattr(args, "force_dataset", None):
+        cfg["dataset"] = args.force_dataset
     ckpt = checkpoint_path(attempt, seed, args.max_steps)
     arts = artifact_paths(attempt, seed, args.max_steps)
 

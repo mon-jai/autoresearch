@@ -33,6 +33,7 @@ DATASET_REGISTRY = {
     "scierc": "data.scierc",
     "conll04": "data.conll04",
     "ade": "data.ade",
+    "accord": "data.code_accord",
 }
 
 

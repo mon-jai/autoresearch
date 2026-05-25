@@ -233,8 +233,9 @@ def load_span_model(checkpoint_path: str, model_name: str, ds_mod, device):
             nn.Linear(h * 3, h), nn.GELU(), nn.Dropout(0.1), nn.Linear(h, n_rel)
         ).to(device)
 
-    model_keys = set(model.state_dict().keys())
-    filtered_state = {k: v for k, v in state.items() if k in model_keys}
+    model_sd = model.state_dict()
+    filtered_state = {k: v for k, v in state.items()
+                      if k in model_sd and v.shape == model_sd[k].shape}
     missing, _ = model.load_state_dict(filtered_state, strict=False)
     if missing:
         print(f"  [warn] missing keys: {missing[:5]}{'...' if len(missing) > 5 else ''}")

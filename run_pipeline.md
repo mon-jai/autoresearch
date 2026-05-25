@@ -5,6 +5,37 @@ for every distinct `BertKGExtractor` experiment configuration in this project.
 
 ---
 
+## Setup
+
+Download the required datasets before running the pipeline. Run these from the
+`autoresearch/` directory (or prefix with `autoresearch/` if running from the
+repo root):
+
+```bash
+# SciERC — required for scierc_* and multi_scierc_* attempts
+python data/download_scierc.py
+
+# CoNLL04 — required for multi_conll04_* attempts
+python data/download_conll04.py
+
+# ADE — required for multi_ade_* attempts
+python data/download_ade.py
+
+# CUAD — required for span_cuad_deberta_pretrain AND span_accord_deberta_phase_b
+python data/download_cuad.py
+
+# arXiv real corpus — required only for stage2b adversarial training
+python data/download_arxiv_real.py
+```
+
+ACCORD data (`data/code_accord/`) is already included in the repository and
+requires no separate download.
+
+All download scripts are idempotent — they skip the download if the target
+files already exist.
+
+---
+
 ## Quick start
 
 ```bash
@@ -19,6 +50,9 @@ uv run python run_pipeline.py --attempt span_accord_deberta_aplus --seed 42
 
 # Dry-run to preview all commands without executing
 uv run python run_pipeline.py --attempt span_accord_deberta_aplus --seed 42 --dry-run
+
+# Smoke-test all 12 attempt configs against ACCORD data (2-step train, verifies code paths)
+uv run python run_pipeline.py --attempt all --force-dataset accord --max-steps 2 --eval-every 1
 
 # Full pipeline including LLM verification and Graph RAG eval (requires Ollama)
 uv run python run_pipeline.py --attempt span_accord_deberta_aplus --seed 42 \
