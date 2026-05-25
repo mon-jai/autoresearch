@@ -217,14 +217,34 @@ EXPERIMENT_CONFIGS = {
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
 
-def checkpoint_path(attempt: str, seed: int, max_steps=None) -> Path:
+def _name_suffix(max_steps=None, eval_every=None, force_dataset=None) -> str:
+    """Build the deterministic filename suffix from every flag that affects output.
+
+    Segment meanings (each only present when the flag was explicitly overridden):
+      _n{N}     --max-steps N        different training budget → different checkpoint
+      _e{N}     --eval-every N       different save cadence    → different checkpoint
+      _d{name}  --force-dataset name different training data   → different checkpoint
+    """
+    s = ""
+    if max_steps is not None:
+        s += f"_n{max_steps}"
+    if eval_every is not None:
+        s += f"_e{eval_every}"
+    if force_dataset is not None:
+        s += f"_d{force_dataset}"
+    return s
+
+
+def checkpoint_path(attempt: str, seed: int, max_steps=None, eval_every=None,
+                    force_dataset=None) -> Path:
     cfg = EXPERIMENT_CONFIGS[attempt]
-    suffix = f"_n{max_steps}" if max_steps is not None else ""
+    suffix = _name_suffix(max_steps, eval_every, force_dataset)
     return Path(f"checkpoints/{cfg['train_script']}_{attempt}_s{seed}{suffix}_best.pt")
 
 
-def artifact_paths(attempt: str, seed: int, max_steps=None) -> dict:
-    suffix = f"_n{max_steps}" if max_steps is not None else ""
+def artifact_paths(attempt: str, seed: int, max_steps=None, eval_every=None,
+                   force_dataset=None) -> dict:
+    suffix = _name_suffix(max_steps, eval_every, force_dataset)
     base = f"{attempt}_s{seed}{suffix}"
     return {
         "inference":   Path(f"results/kg_{base}_inference.jsonl"),
@@ -259,7 +279,8 @@ def run_cmd(cmd: list, dry_run: bool = False) -> int:
 # ── Pipeline steps ────────────────────────────────────────────────────────────
 
 def step_train(cfg, attempt, seed, checkpoint, dry_run, device,
-               max_steps_override=None, eval_every_override=None, force=False):
+               max_steps_override=None, eval_every_override=None, force=False,
+               force_dataset=None):
     """5a: Train the model and save the best checkpoint."""
     if not dry_run and not force and checkpoint.exists():
         print(f"[skip] checkpoint already exists: {checkpoint}")
@@ -294,7 +315,8 @@ def step_train(cfg, attempt, seed, checkpoint, dry_run, device,
 
     if "requires_pretrain" in cfg:
         pretrain_name = cfg["requires_pretrain"]
-        pretrain_ckpt = checkpoint_path(pretrain_name, seed, max_steps_override)
+        pretrain_ckpt = checkpoint_path(pretrain_name, seed, max_steps_override,
+                                        eval_every_override, force_dataset)
         if not dry_run and not pretrain_ckpt.exists():
             print(f"[error] Phase B requires pretrain checkpoint: {pretrain_ckpt}")
             print(f"  Run --attempt {pretrain_name} --seed {seed} first.")
@@ -595,10 +617,11 @@ def _list_attempts():
 
 def _run_attempt(attempt, seed, steps, args):
     cfg = dict(EXPERIMENT_CONFIGS[attempt])   # shallow copy — safe to mutate
-    if getattr(args, "force_dataset", None):
-        cfg["dataset"] = args.force_dataset
-    ckpt = checkpoint_path(attempt, seed, args.max_steps)
-    arts = artifact_paths(attempt, seed, args.max_steps)
+    fd = getattr(args, "force_dataset", None)
+    if fd:
+        cfg["dataset"] = fd
+    ckpt = checkpoint_path(attempt, seed, args.max_steps, args.eval_every, fd)
+    arts = artifact_paths(attempt, seed, args.max_steps, args.eval_every, fd)
 
     print(f"\n{'='*64}")
     print(f"ATTEMPT : {attempt}")
@@ -614,7 +637,8 @@ def _run_attempt(attempt, seed, steps, args):
         rc = step_train(cfg, attempt, seed, ckpt, args.dry_run, args.device,
                         max_steps_override=args.max_steps,
                         eval_every_override=args.eval_every,
-                        force=args.force)
+                        force=args.force,
+                        force_dataset=fd)
         if rc != 0:
             print(f"[warn] train failed (rc={rc}); subsequent steps will skip if checkpoint/data missing")
 
