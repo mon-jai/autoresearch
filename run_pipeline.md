@@ -106,33 +106,41 @@ Default `--steps`: `train,infer,build,triple,compare`
 ## File naming convention
 
 ```
-checkpoints/{train_script}_{attempt}_s{seed}_best.pt
-checkpoints/{train_script}_{attempt}_s{seed}_n{max_steps}_best.pt  # when --max-steps is set
+checkpoints/{train_script}_{attempt}_s{seed}[_n{N}][_e{N}][_d{dataset}]_best.pt
 
-results/kg_{attempt}_s{seed}_inference.jsonl      # raw predicted + gold triples
-results/kg_{attempt}_s{seed}_verified.jsonl       # after LLM verification
-results/kg_{attempt}_s{seed}.json                 # built KG graph
-results/graph_rag_{attempt}_s{seed}.json          # RAG evaluation results
-results/kg_compare_{attempt}_s{seed}.json         # triple overlap F1 scores
-results/triple_eval_{attempt}_s{seed}.json        # NER F1 + Triple F1 from eval step
-results/pipeline_results.csv                      # unified table (all attempts × seeds)
+results/kg_{attempt}_s{seed}[suffix]_inference.jsonl      # raw predicted + gold triples
+results/kg_{attempt}_s{seed}[suffix]_verified.jsonl       # after LLM verification
+results/kg_{attempt}_s{seed}[suffix].json                 # built KG graph
+results/graph_rag_{attempt}_s{seed}[suffix].json          # RAG evaluation results
+results/kg_compare_{attempt}_s{seed}[suffix].json         # triple overlap F1 scores
+results/triple_eval_{attempt}_s{seed}[suffix].json        # NER F1 + Triple F1 from eval step
+results/pipeline_results.csv                              # unified table (all attempts × seeds)
 ```
 
-The `_n{max_steps}` suffix is appended to all paths when `--max-steps` is passed,
-preventing smoke-test runs (e.g. `--max-steps 2`) from overwriting production checkpoints.
+The optional `[suffix]` segments are each present only when their flag is explicitly passed,
+so every flag that affects the output is reflected in the filename:
+
+| Segment | Flag | Effect on output |
+|---|---|---|
+| `_n{N}` | `--max-steps N` | Different training budget → different checkpoint |
+| `_e{N}` | `--eval-every N` | Different save cadence → different checkpoint |
+| `_d{name}` | `--force-dataset name` | Different training data → different checkpoint |
+
+Segments are appended in that order. A production run (no overrides) has no suffix at all.
 
 Examples:
 ```
+# Production run (no overrides)
 checkpoints/train_span_span_accord_deberta_aplus_s42_best.pt
 results/kg_span_accord_deberta_aplus_s42_inference.jsonl
-results/kg_span_accord_deberta_aplus_s42.json
-results/kg_compare_span_accord_deberta_aplus_s42.json
-results/triple_eval_span_accord_deberta_aplus_s42.json
-results/pipeline_results.csv
 
-# Smoke-test artifacts (--max-steps 2):
-checkpoints/train_span_span_accord_deberta_aplus_s42_n2_best.pt
-results/kg_span_accord_deberta_aplus_s42_n2_inference.jsonl
+# Smoke test: --max-steps 2 --eval-every 1
+checkpoints/train_span_span_accord_deberta_aplus_s42_n2_e1_best.pt
+results/kg_span_accord_deberta_aplus_s42_n2_e1_inference.jsonl
+
+# Cross-dataset smoke test: --max-steps 2 --eval-every 1 --force-dataset accord
+checkpoints/train_stage2_scierc_bert_s42_n2_e1_daccord_best.pt
+results/kg_scierc_bert_s42_n2_e1_daccord_inference.jsonl
 ```
 
 ---
