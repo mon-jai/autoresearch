@@ -101,6 +101,8 @@ Phase A+ flags (A20+A21+A12):
 Default `--steps`: `train,infer,build,triple,compare`
 (verify and rag are omitted by default as they require Ollama)
 
+Use `--steps all` as shorthand for `train,infer,verify,build,triple,rag,compare`.
+
 ---
 
 ## File naming convention
@@ -163,16 +165,129 @@ The master script automatically injects `--pretrain-ckpt checkpoints/train_span_
 
 ---
 
-## Multi-seed evaluation (8 seeds, matching Phase A+ protocol)
+## Reproducing all documented results + full evaluation
+
+Requires Ollama running locally for the `verify` and `rag` steps.
 
 ```bash
-for seed in 42 47 51 55 57 61 67 71; do
+# Step 1 — all 12 attempts at seed 42.
+#
+# Seed 42 is the only documented seed for every attempt except where noted below.
+#
+#   scierc_bert             morning_2026-04-11.md, morning_2026-04-12.md
+#                           Stage 2 BIO baseline; seed 42 used throughout
+#                           (morning_2026-04-14.md: "All experiments used seed 42").
+#
+#   multi_scierc_scibert    morning_2026-04-12.md, morning_2026-04-13.md
+#   multi_conll04_bert      morning_2026-04-13.md, morning_2026-04-14.md
+#   multi_ade_scibert       morning_2026-04-13.md, morning_2026-04-14.md
+#                           BIO multi-dataset baselines run at seed 42 only. The 5-seed
+#                           validation (42,123,456,7,13) in morning_2026-04-17.md was for
+#                           train_span with --bio-weight, not train_multi — a different
+#                           script and config; those results do not apply here.
+#
+#   span_scierc_scibert     morning_2026-04-14.md, morning_2026-04-15.md
+#                           Span v10; seed 42 is the primary sweep seed
+#                           (morning_2026-04-14.md: "All experiments used seed 42 except
+#                           multi-seed validation (42, 123, 456)").
+#                           Seeds 123, 456, 7, 13 reproduced in Step 2 below.
+#
+#   span_scierc_scibert_bio morning_2026-04-16.md, morning_2026-04-17.md, morning_2026-04-18.md
+#                           BIO multi-task; seed 42 is the primary result seed.
+#                           Seeds 123, 456, 7, 13 reproduced in Step 2 below.
+#
+#   span_accord_bert        morning_2026-04-19.md, morning_2026-04-21.md
+#                           morning_2026-04-21.md shows seed 42 | 0.373 and seed 123 | 0.368,
+#                           but that 2-seed run used flags (bio=0.1, neg=3.0, re_focal=2.0,
+#                           conf=0.3) that are absent from this attempt's config in
+#                           run_pipeline.py. Seed 123 is not reproducible with the current
+#                           definition; seed 42 only.
+#
+#   span_accord_deberta     morning_2026-04-25.md, morning_2026-04-30.md,
+#                           morning_2026-05-01.md, morning_2026-05-02.md
+#                           8-seed (42–49) fully documented; morning_2026-05-01.md:
+#                           "best DeBERTa-large checkpoint remains seed 42 (dev Triple=0.4288)".
+#                           Seeds 43–49 reproduced in Step 2 below.
+#
+#   span_accord_deberta_a12 morning_2026-05-09.md, morning_2026-05-10.md
+#                           A12 (--re-context-span) standalone was not run 8-seed. The 8-seed
+#                           run in morning_2026-05-10.md was for A16+A12 combined (adds
+#                           adaptive boost flags absent from this config); those results do
+#                           not apply here. Seed 42 only.
+#
+#   span_accord_deberta_aplus  morning_2026-05-10.md – morning_2026-05-14.md
+#                           8-seed (42–49); seeds 43–49 reproduced in Step 2 below.
+#
+#   span_cuad_deberta_pretrain morning_2026-05-14.md, morning_2026-05-16.md
+#                           morning_2026-05-14.md: "CUAD Pre-train (3500 steps, seed=42)".
+#                           Only seed 42 was ever run for the pretrain step; all Phase B
+#                           fine-tunes in morning_2026-05-16.md used cuad_pretrain_s42_short.pt.
+#
+#   span_accord_deberta_phase_b  morning_2026-05-16.md, morning_2026-05-18.md, morning_2026-05-19.md
+#                           8-seed fine-tune (seeds 42–49) from a single CUAD checkpoint
+#                           (cuad_pretrain_s42_short.pt); morning_2026-05-16.md:
+#                           mean=0.4096, std=0.0205. run_pipeline.py derives --pretrain-ckpt
+#                           from the fine-tune seed, so seeds 43–49 would look for CUAD
+#                           checkpoints that were never created. Not reproducible for seeds
+#                           43–49 without a code change to run_pipeline.py.
+#
+# span_cuad_deberta_pretrain runs before span_accord_deberta_phase_b automatically.
+uv run python run_pipeline.py \
+    --attempt all \
+    --seed 42 \
+    --steps all \
+    --ollama-url http://localhost:11434
+
+# Step 2a — span_accord_deberta remaining seeds (43–49).
+# morning_2026-04-30.md, morning_2026-05-01.md: 8-seed mean=0.3797 ± 0.0346.
+# Per-seed dev: s42=0.4288, s43=0.380, s44=0.378, s45=0.415,
+#              s46=0.3697, s47=0.3121, s48=0.3738, s49=0.3805
+for seed in 43 44 45 46 47 48 49; do
+    uv run python run_pipeline.py \
+        --attempt span_accord_deberta \
+        --seed $seed \
+        --steps all \
+        --ollama-url http://localhost:11434
+done
+
+# Step 2b — span_scierc_scibert remaining seeds (123, 456, 7, 13).
+# morning_2026-04-15.md, morning_2026-04-18.md: 5-seed no-BIO baseline mean=0.353 ± 0.010.
+# Per-seed dev: s42=0.343, s123=0.366, s456=0.356, s7=0.358, s13=0.343
+for seed in 123 456 7 13; do
+    uv run python run_pipeline.py \
+        --attempt span_scierc_scibert \
+        --seed $seed \
+        --steps all \
+        --ollama-url http://localhost:11434
+done
+
+# Step 2c — span_scierc_scibert_bio remaining seeds (123, 456, 7, 13).
+# morning_2026-04-16.md, morning_2026-04-18.md: 5-seed mean=0.398 ± 0.002.
+# Per-seed dev (log-verified): s42=0.398, s123=0.394, s456=0.400, s7=0.399, s13=0.397
+for seed in 123 456 7 13; do
+    uv run python run_pipeline.py \
+        --attempt span_scierc_scibert_bio \
+        --seed $seed \
+        --steps all \
+        --ollama-url http://localhost:11434
+done
+
+# Step 2d — span_accord_deberta_aplus remaining seeds (43–49).
+# morning_2026-05-11.md, morning_2026-05-19.md: 8-seed mean=0.4097 ± 0.0356, peak 0.4746 (s47).
+# Per-seed dev: s42=0.3969, s43=0.4330, s44=0.4257, s45=0.3542,
+#              s46=0.4000, s47=0.4746, s48=0.4061, s49=0.3871
+for seed in 43 44 45 46 47 48 49; do
     uv run python run_pipeline.py \
         --attempt span_accord_deberta_aplus \
         --seed $seed \
-        --steps train,triple
+        --steps all \
+        --ollama-url http://localhost:11434
 done
 ```
+
+`--steps all` runs every step (`train,infer,verify,build,triple,rag,compare`) in a single
+pass. If a checkpoint already exists from a prior run, the `train` step is skipped
+automatically — no redundant training.
 
 ---
 

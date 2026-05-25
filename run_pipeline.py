@@ -11,6 +11,7 @@ Usage:
     python run_pipeline.py --attempt scierc_bert --seed 42
     python run_pipeline.py --attempt accord_deberta_aplus --seed 42
     python run_pipeline.py --attempt accord_deberta_aplus --seed 42 --steps train,infer,triple
+    python run_pipeline.py --attempt accord_deberta_aplus --seed 42 --steps all
     python run_pipeline.py --attempt all --seed 42 --dry-run
 
     # Phase B requires CUAD pretrain first:
@@ -133,7 +134,7 @@ EXPERIMENT_CONFIGS = {
             "--max-steps", "3000",
             "--warmup-steps", "250",
             "--eval-every", "200",
-            "--bio-weight", "0.1",
+            "--bio-weight", "0.3",
         ],
         "description": "Phase 14: Span+BIO multi-task, SciERC, SciBERT [reports: morning_2026-04-16.md, morning_2026-04-17.md, morning_2026-04-18.md]",
     },
@@ -478,10 +479,10 @@ def main():
         "--steps",
         default="train,infer,build,triple,compare",
         help=(
-            "Comma-separated pipeline steps. "
+            "Comma-separated pipeline steps, or 'all' to run every step. "
             "Available: train, infer, verify, build, triple, rag, compare. "
             "Default omits verify/rag (require Ollama). "
-            "Use 'train,infer,verify,build,triple,rag,compare' for full pipeline."
+            "Use 'all' or 'train,infer,verify,build,triple,rag,compare' for the full pipeline."
         ),
     )
     p.add_argument("--dry-run", action="store_true",
@@ -520,11 +521,14 @@ def main():
             print(f"[error] Unknown attempt: {name!r}. Use --list-attempts.")
             sys.exit(1)
 
-    steps = {s.strip() for s in args.steps.split(",")}
     valid_steps = {"train", "infer", "verify", "build", "triple", "rag", "compare"}
+    if args.steps.strip().lower() == "all":
+        steps = set(valid_steps)
+    else:
+        steps = {s.strip() for s in args.steps.split(",")}
     unknown_steps = steps - valid_steps
     if unknown_steps:
-        p.error(f"Unknown steps: {unknown_steps}. Valid: {sorted(valid_steps)}")
+        p.error(f"Unknown steps: {unknown_steps}. Valid: {sorted(valid_steps)} or 'all'.")
 
     for attempt in attempts:
         _run_attempt(attempt, args.seed, steps, args)
