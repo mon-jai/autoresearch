@@ -41,6 +41,20 @@ _PYTHON = (
 )
 
 
+# ── A16+A12 flags (Phase A16+A12, first >0.40 mean) ─────────────────────────
+# Source: morning_2026-05-09.md ("5x→2x adaptive at step 1000"),
+#         morning_2026-05-10.md (A16+A12 8-seed: mean 0.4050 ± 0.0294)
+# A16: adaptive boost — if dev Triple F1 ≥ 0.35 at step 1000, decay boost 5x→2x;
+#      otherwise keep 5x for the remaining steps.
+# A12: --re-context-span (inter-span token mean as third RE feature vector)
+_A16_A12 = [
+    "--re-comparison-boost", "5.0",
+    "--re-boost-end", "2.0",
+    "--re-boost-adaptive-steps", "1000",
+    "--re-boost-adaptive-threshold", "0.35",
+    "--re-context-span",
+]
+
 # ── A20+A21+A12 production baseline flags (Phase A+) ─────────────────────────
 # Source: scripts/run_train_accord.sh
 _A20_A21_A12 = [
@@ -148,8 +162,12 @@ EXPERIMENT_CONFIGS = {
             "--max-steps", "3500",
             "--warmup-steps", "250",
             "--eval-every", "200",
+            "--bio-weight", "0.1",
+            "--neg-sample-ratio", "3.0",
+            "--re-focal-gamma", "2.0",
+            "--re-train-conf", "0.3",
         ],
-        "description": "Phase A early: Span NER, ACCORD, BERT-base [reports: morning_2026-04-19.md, morning_2026-04-20.md, morning_2026-04-21.md]",
+        "description": "Phase A early: Span NER, ACCORD, BERT-base (bio=0.1, neg=3.0, re_focal=2.0, conf=0.3) [reports: morning_2026-04-19.md, morning_2026-04-20.md, morning_2026-04-21.md]",
     },
     "span_accord_deberta": {
         "train_script": "train_span",
@@ -162,7 +180,7 @@ EXPERIMENT_CONFIGS = {
         ],
         "description": "Phase A: Span NER, ACCORD, DeBERTa-large (no A-flags) [reports: morning_2026-04-25.md, morning_2026-04-30.md, morning_2026-05-01.md, morning_2026-05-02.md]",
     },
-    "span_accord_deberta_a12": {
+    "span_accord_deberta_a16_a12": {
         "train_script": "train_span",
         "dataset": "accord",
         "model_name": "microsoft/deberta-large",
@@ -170,9 +188,8 @@ EXPERIMENT_CONFIGS = {
             "--max-steps", "3500",
             "--warmup-steps", "250",
             "--eval-every", "200",
-            "--re-context-span",
-        ],
-        "description": "Phase A12: DeBERTa-large + context-span RE, ACCORD [reports: morning_2026-05-09.md, morning_2026-05-10.md]",
+        ] + _A16_A12,
+        "description": "Phase A16+A12: DeBERTa-large + adaptive boost + context-span RE, ACCORD (first >0.40 mean: 0.4050±0.029) [reports: morning_2026-05-09.md, morning_2026-05-10.md]",
     },
     "span_accord_deberta_aplus": {
         "train_script": "train_span",

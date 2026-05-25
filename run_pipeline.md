@@ -74,7 +74,7 @@ uv run python run_pipeline.py --attempt span_accord_deberta_aplus --seed 42 \
 | `span_scierc_scibert_bio` | `train_span` | SciERC | Phase 14: Span+BIO multi-task, SciBERT |
 | `span_accord_bert` | `train_span` | ACCORD | Phase A early: Span NER, BERT-base |
 | `span_accord_deberta` | `train_span` | ACCORD | Phase A: DeBERTa-large, no A-flags |
-| `span_accord_deberta_a12` | `train_span` | ACCORD | Phase A12: + context-span RE |
+| `span_accord_deberta_a16_a12` | `train_span` | ACCORD | Phase A16+A12: + adaptive boost + context-span RE |
 | `span_accord_deberta_aplus` | `train_span` | ACCORD | **Phase A+: + A20+A21+A12 (best: 0.4097±0.036)** |
 | `span_cuad_deberta_pretrain` | `train_span` | CUAD | Phase B step 1: NER pre-training on CUAD |
 | `span_accord_deberta_phase_b` | `train_span` | ACCORD | **Phase B: + CUAD pre-train (std −42%)** |
@@ -197,11 +197,10 @@ Requires Ollama running locally for the `verify` and `rag` steps.
 #                           Seeds 123, 456, 7, 13 reproduced in Step 2 below.
 #
 #   span_accord_bert        morning_2026-04-19.md, morning_2026-04-21.md
-#                           morning_2026-04-21.md shows seed 42 | 0.373 and seed 123 | 0.368,
-#                           but that 2-seed run used flags (bio=0.1, neg=3.0, re_focal=2.0,
-#                           conf=0.3) that are absent from this attempt's config in
-#                           run_pipeline.py. Seed 123 is not reproducible with the current
-#                           definition; seed 42 only.
+#                           morning_2026-04-21.md: 2-seed (42, 123) with
+#                           bio=0.1, neg=3.0, re_focal=2.0, conf=0.3;
+#                           per-seed dev: s42=0.373, s123=0.368, mean=0.371.
+#                           Seed 123 reproduced in Step 2 below.
 #
 #   span_accord_deberta     morning_2026-04-25.md, morning_2026-04-30.md,
 #                           morning_2026-05-01.md, morning_2026-05-02.md
@@ -209,11 +208,11 @@ Requires Ollama running locally for the `verify` and `rag` steps.
 #                           "best DeBERTa-large checkpoint remains seed 42 (dev Triple=0.4288)".
 #                           Seeds 43–49 reproduced in Step 2 below.
 #
-#   span_accord_deberta_a12 morning_2026-05-09.md, morning_2026-05-10.md
-#                           A12 (--re-context-span) standalone was not run 8-seed. The 8-seed
-#                           run in morning_2026-05-10.md was for A16+A12 combined (adds
-#                           adaptive boost flags absent from this config); those results do
-#                           not apply here. Seed 42 only.
+#   span_accord_deberta_a16_a12  morning_2026-05-09.md, morning_2026-05-10.md
+#                           morning_2026-05-10.md: A16+A12 8-seed mean=0.4050 ± 0.0294;
+#                           per-seed: s42=0.4160, s43=0.3974, s44=0.4275, s45=0.3900,
+#                           s46=0.3548, s47=0.4551, s48=0.3944, s49=0.4049.
+#                           Seeds 43–49 reproduced in Step 2 below.
 #
 #   span_accord_deberta_aplus  morning_2026-05-10.md – morning_2026-05-14.md
 #                           8-seed (42–49); seeds 43–49 reproduced in Step 2 below.
@@ -238,7 +237,27 @@ uv run python run_pipeline.py \
     --steps all \
     --ollama-url http://localhost:11434
 
-# Step 2a — span_accord_deberta remaining seeds (43–49).
+# Step 2a — span_accord_bert seed 123.
+# morning_2026-04-21.md: 2-seed result; s42=0.373, s123=0.368, mean=0.371.
+uv run python run_pipeline.py \
+    --attempt span_accord_bert \
+    --seed 123 \
+    --steps all \
+    --ollama-url http://localhost:11434
+
+# Step 2b — span_accord_deberta_a16_a12 remaining seeds (43–49).
+# morning_2026-05-10.md: A16+A12 8-seed mean=0.4050 ± 0.0294.
+# Per-seed dev: s42=0.4160, s43=0.3974, s44=0.4275, s45=0.3900,
+#              s46=0.3548, s47=0.4551, s48=0.3944, s49=0.4049
+for seed in 43 44 45 46 47 48 49; do
+    uv run python run_pipeline.py \
+        --attempt span_accord_deberta_a16_a12 \
+        --seed $seed \
+        --steps all \
+        --ollama-url http://localhost:11434
+done
+
+# Step 2c — span_accord_deberta remaining seeds (43–49).
 # morning_2026-04-30.md, morning_2026-05-01.md: 8-seed mean=0.3797 ± 0.0346.
 # Per-seed dev: s42=0.4288, s43=0.380, s44=0.378, s45=0.415,
 #              s46=0.3697, s47=0.3121, s48=0.3738, s49=0.3805
@@ -250,7 +269,7 @@ for seed in 43 44 45 46 47 48 49; do
         --ollama-url http://localhost:11434
 done
 
-# Step 2b — span_scierc_scibert remaining seeds (123, 456, 7, 13).
+# Step 2d — span_scierc_scibert remaining seeds (123, 456, 7, 13).
 # morning_2026-04-15.md, morning_2026-04-18.md: 5-seed no-BIO baseline mean=0.353 ± 0.010.
 # Per-seed dev: s42=0.343, s123=0.366, s456=0.356, s7=0.358, s13=0.343
 for seed in 123 456 7 13; do
@@ -261,7 +280,7 @@ for seed in 123 456 7 13; do
         --ollama-url http://localhost:11434
 done
 
-# Step 2c — span_scierc_scibert_bio remaining seeds (123, 456, 7, 13).
+# Step 2e — span_scierc_scibert_bio remaining seeds (123, 456, 7, 13).
 # morning_2026-04-16.md, morning_2026-04-18.md: 5-seed mean=0.398 ± 0.002.
 # Per-seed dev (log-verified): s42=0.398, s123=0.394, s456=0.400, s7=0.399, s13=0.397
 for seed in 123 456 7 13; do
@@ -272,7 +291,7 @@ for seed in 123 456 7 13; do
         --ollama-url http://localhost:11434
 done
 
-# Step 2d — span_accord_deberta_aplus remaining seeds (43–49).
+# Step 2f — span_accord_deberta_aplus remaining seeds (43–49).
 # morning_2026-05-11.md, morning_2026-05-19.md: 8-seed mean=0.4097 ± 0.0356, peak 0.4746 (s47).
 # Per-seed dev: s42=0.3969, s43=0.4330, s44=0.4257, s45=0.3542,
 #              s46=0.4000, s47=0.4746, s48=0.4061, s49=0.3871
